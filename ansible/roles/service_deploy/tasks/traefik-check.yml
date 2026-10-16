@@ -1,0 +1,48 @@
+---
+# Traefik label collision check: no OTHER running container on this host may
+# already claim the domain(s) this service is about to route.
+#
+# Static collisions across services.yml (incl. inactive entries and aliases)
+# are the validator's job (scripts/validate_services.py). This is the live
+# check against what is running right now, which the validator cannot see.
+#
+# Own containers must be excluded, or a redeploy collides with ITSELF and no
+# running service could ever be deployed again. "Own" is decided by the
+# `com.docker.compose.project` label, NOT by the container name: a name-prefix
+# test only works for compose-generated names, and any service that sets
+# `container_name:` explicitly carries no project prefix at all. Same rule as
+# sd_project: ask the label, never the name.
+- name: Collect Traefik-enabled containers that are NOT part of this stack
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      docker ps --filter "label=traefik.enable=true"
+      --format '{{ '{{' }}.Names{{ '}}' }}'
+      | grep -vxF -f <(docker ps --filter "label=traefik.enable=true"
+      --filter "label=com.docker.compose.project={{ sd_project }}"
+      --format '{{ '{{' }}.Names{{ '}}' }}')
+      || true
+    executable: /bin/bash
+  register: sd_other_containers
+  changed_when: false
+  check_mode: false
+
+- name: Inspect labels of those containers
+  ansible.builtin.command:
+    cmd: docker inspect --format '{{ '{{' }}json .Config.Labels{{ '}}' }}' {{ item }}
+  loop: "{{ sd_other_containers.stdout_lines }}"
+  register: sd_other_labels
+  changed_when: false
+  check_mode: false
+
+- name: Assert no other container already routes the resolved domain(s)
+  ansible.builtin.assert:
+    that: >-
+      (sd_other_labels.results | default([]) | map(attribute='stdout') | join('\n'))
+      is not search('Host\\(`' ~ item ~ '`\\)')
+    fail_msg: >-
+      Domain '{{ item }}' is already claimed by a running Traefik-enabled
+      container on {{ service_host }} — resolve the collision before deploying
+      '{{ service_name }}'.
+  loop: "{{ ([service_domain] + (service_aliases | default([]))) | select | list }}"
+  when: sd_other_labels.results | default([]) | length > 0

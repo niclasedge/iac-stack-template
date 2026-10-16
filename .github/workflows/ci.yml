@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: extractions/setup-just@v2
+      - name: Install Ansible
+        run: uv tool install --force ansible
+      - name: Unit and structural tests
+        run: just test
+      - name: services.yml contract
+        run: just validate
+      - name: Playbook syntax check
+        run: just syntax
+      - name: ansible-lint
+        run: just lint
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v8.21.2 --repo gitleaks/gitleaks --pattern '*linux_x64.tar.gz'
+          tar -xzf gitleaks_8.21.2_linux_x64.tar.gz gitleaks
+          ./gitleaks git --no-banner --redact .

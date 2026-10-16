@@ -1,0 +1,14 @@
+---
+service_base_dir: /home/deploy/apps
+
+# This host runs Elasticsearch, Kibana and Filebeat (runbooks/monitoring_stack.yml)
+# and is the destination of every structured result log (`es_log_host`). It is
+# the only group_vars file that sets log_output_dir: the directory is the host
+# side of Filebeat's /logs bind mount.
+log_output_dir: /home/deploy/monitoring/logs
+
+expected_containers:
+  - traefik
+  - iac-es
+  - iac-kibana
+  - iac-filebeat

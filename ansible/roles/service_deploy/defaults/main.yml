@@ -1,0 +1,27 @@
+---
+# service_deploy defaults — fallbacks only. ansible/playbooks/deploy.yml sets
+# every one of these from services.yml before applying the role; a value here
+# only matters when the role is called directly for a quick manual test.
+service_repo: ""
+service_compose_file: docker-compose.yml
+service_domain: ""
+service_aliases: []
+service_health: ""
+service_deploy: compose-pull
+service_base_dir_override: ""
+# Empty means "use service_name as the directory" (see tasks/main.yml).
+service_path: ""
+# compose-pull only: paths beside the compose file that travel to the host.
+# Empty means the compose file alone.
+service_sync: []
+# Re-render .env from .env.j2 on every deploy (services.yml `env_rerender`).
+# Off by default: templates that generate their secrets must render only once.
+service_env_rerender: false
+# {compose variable: key in secrets/app.env}. Non-empty means the .env is
+# rendered from the encrypted file and .env.j2 is not used at all.
+service_env_from_secrets: {}
+# Recreate containers even when their config is unchanged
+# (-e sd_force_recreate=true). Off by default: a deploy should not restart what
+# it did not change. Needed when a DAEMON default changed instead of the
+# compose file, see compose-up.yml.
+sd_force_recreate: false

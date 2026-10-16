@@ -1,0 +1,76 @@
+# Elastic Stack — log and health monitoring (development variant)
+# Version: 8.15.0 (check https://www.docker.elastic.co/ for newer releases)
+#
+# Usage (from the repo root):
+#   just monitoring up -d       # start the stack
+#   just monitoring down        # stop it
+#   just monitoring logs -f     # follow logs
+#
+# Kibana:        http://localhost:5601
+# Elasticsearch: http://localhost:9200
+#
+# This is a single-node development setup: no TLS, no authentication
+# (xpack.security.enabled=false), placeholder Kibana encryption key. The
+# production variant is rendered by ansible/playbooks/runbooks/monitoring_stack.yml
+# from templates/monitoring/docker-compose.yml.j2; read its header before
+# exposing anything to a network you do not control.
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: iac-es
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - cluster.name=iac-stack
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: iac-kibana
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      # Placeholder, not a secret: security is disabled and this key only
+      # encrypts saved objects of features this setup does not use. Replace it
+      # before enabling any Kibana feature that stores credentials.
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=not-secure-dev-only-change-me-aaaa
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.0
+    container_name: iac-filebeat
+    user: root
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./logs:/logs:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  es-data:
+    driver: local

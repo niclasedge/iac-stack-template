@@ -1,0 +1,6 @@
+---
+# The workstation is a controller and a workstation, not a service host: it
+# runs Ansible and `just`, and can run the monitoring stack for local
+# experiments (`just monitoring up -d`). Services declared in services.yml
+# should target the vps or homelab hosts.
+service_base_dir: "{{ lookup('env', 'HOME') }}/apps"

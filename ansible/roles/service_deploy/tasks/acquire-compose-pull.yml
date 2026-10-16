@@ -1,0 +1,90 @@
+---
+# Acquisition pattern: compose-pull — a prebuilt-image service. The compose
+# file lives in services/<name>/ (sd_local_dir) and is copied to the target;
+# `docker compose pull` then fetches fresh images.
+#
+# Anything the service ships NEXT to the compose file (a sidecar script, a
+# ./config directory) travels only if `sync:` in services.yml names it. On a
+# fresh host docker creates a *directory* at an absent bind-mount source, and
+# the container then fails on a path that is suddenly a folder. `sync:` makes
+# the file list a declaration instead of an accident, and
+# scripts/validate_services.py refuses a compose-pull service whose ./ mount
+# is not covered.
+- name: Fail fast if the service has no directory in the repo
+  ansible.builtin.stat:
+    path: "{{ sd_local_dir }}"
+  register: sd_local_dir_stat
+  delegate_to: localhost
+  check_mode: false
+
+- name: Assert the service directory exists
+  ansible.builtin.assert:
+    that: sd_local_dir_stat.stat.exists and sd_local_dir_stat.stat.isdir
+    fail_msg: >-
+      '{{ service_name }}' has no directory at {{ sd_local_dir }} —
+      deploy: compose-pull copies its compose file from there.
+
+- name: Copy the compose file to the target
+  ansible.builtin.copy:
+    src: "{{ sd_local_dir }}/{{ service_compose_file }}"
+    dest: "{{ sd_remote_dir }}/{{ service_compose_file }}"
+    mode: "0644"
+
+# One stat per declared path, because the trailing slash decides what `copy`
+# does with a directory: `src: config` would nest it as config/config, `src:
+# config/` copies its contents into dest. Getting that wrong is silent.
+- name: Stat the declared sync paths on the controller
+  ansible.builtin.stat:
+    path: "{{ sd_local_dir }}/{{ item }}"
+  loop: "{{ service_sync | default([]) }}"
+  register: sd_sync_stat
+  delegate_to: localhost
+  check_mode: false
+
+- name: Assert every declared sync path exists
+  # A typo here is worse than a missing entry: docker would create a DIRECTORY
+  # at the absent bind-mount source on the target. Fail on the controller.
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: >-
+      {{ service_name }}: sync: names '{{ item.item }}', which does not exist in
+      {{ sd_local_dir }}. Fix the path in services.yml — a bind mount whose
+      source is missing makes docker create a directory there.
+  loop: "{{ sd_sync_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  delegate_to: localhost
+  check_mode: false
+
+- name: Ensure the parent directory exists for file sync paths
+  # ansible.copy does not create the destination's parent directory. A sync
+  # entry nested below a new directory (auth/config.toml) would fail with
+  # "Destination directory does not exist" on the first deploy.
+  ansible.builtin.file:
+    path: "{{ sd_remote_dir }}/{{ item.item | dirname }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ sd_sync_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - not item.stat.isdir
+    - item.item is search('/')
+
+- name: Copy the declared sync paths to the target
+  ansible.builtin.copy:
+    src: "{{ sd_local_dir }}/{{ item.item }}{{ '/' if item.stat.isdir else '' }}"
+    dest: "{{ sd_remote_dir }}/{{ item.item }}"
+    # Preserve the executable bit; a sidecar is often a script.
+    mode: preserve
+  loop: "{{ sd_sync_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Pull images
+  ansible.builtin.command:
+    cmd: docker compose -p {{ sd_project }} -f "{{ service_compose_file }}" pull -q
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_pull
+  changed_when: sd_pull.stdout | trim | length > 0
+  when: not ansible_check_mode

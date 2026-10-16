@@ -1,0 +1,137 @@
+---
+# UFW as a declaration instead of a pile of hand-typed rules.
+#
+# The source of truth is `ufw_rules` in group_vars/vps/main.yml. This playbook
+# converges the host against it: missing rules are added, rules that are NOT
+# declared there are deleted. That is the whole point: a firewall you can only
+# read by logging in is one nobody reads.
+#
+#   just firewall-check     # dry run: prints the diff, changes nothing
+#   just firewall           # converge
+#
+# Three things keep this from locking anyone out:
+#
+# 1. It refuses to run unless an SSH rule is declared. Converging to a list that
+#    forgot port 22 would delete the only way back in; on a VPS that means a
+#    support ticket, not a fix.
+# 2. Rules are ADDED BEFORE any are deleted. The reverse order has a window in
+#    which neither the old nor the new rule exists; for a monitoring agent that
+#    window is a gap, for SSH it would be the end of the session.
+# 3. It refuses to run if `ufw show added` comes back empty. An empty read
+#    would look exactly like "nothing declared, delete everything": the parser
+#    failing must not be indistinguishable from the host having no rules.
+#
+# `--check` prints the diff and changes nothing, which is the honest dry run:
+# every command below is guarded on `not ansible_check_mode` rather than
+# relying on `command`'s (non-existent) check-mode support.
+- name: Converge the UFW rule set on the VPS
+  hosts: vps
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Assert the declaration exists and keeps SSH
+      # `ufw_rules` lives in group_vars/vps; an undefined variable here means
+      # the inventory was not loaded (an inventory passed without its
+      # group_vars directory skips them), and converging against an empty list
+      # would wipe the firewall.
+      ansible.builtin.assert:
+        that:
+          - ufw_rules is defined
+          - ufw_rules | length > 0
+          - ufw_rules | selectattr('spec', 'search', '22/tcp') | list | length > 0
+        fail_msg: >-
+          ufw_rules is missing, empty, or has no rule for 22/tcp. Refusing to
+          converge: this would delete the SSH rule and lock everyone out of
+          {{ inventory_hostname }}.
+
+    - name: Read the rules the host has now
+      # `show added` prints each rule as the command that created it, which
+      # makes the comparison a string match instead of a parser. `ufw status`
+      # would need one and would drift from the syntax used to write rules.
+      ansible.builtin.command: ufw show added
+      register: fw_current
+      changed_when: false
+      check_mode: false
+
+    - name: Turn both sides into comparable sets
+      ansible.builtin.set_fact:
+        fw_have: >-
+          {{ fw_current.stdout_lines
+             | select('match', '^ufw ')
+             | map('trim') | list }}
+        fw_want: >-
+          {{ ufw_rules
+             | map(attribute='spec')
+             | zip(ufw_rules | map(attribute='comment', default=''))
+             | map('join', "@@") | list
+             | map('regex_replace', '^(.*)@@$', 'ufw \1')
+             | map('regex_replace', '^(.*)@@(.+)$', "ufw \1 comment '\2'")
+             | list }}
+
+    - name: Refuse to converge against an unreadable current state
+      ansible.builtin.assert:
+        that: fw_have | length > 0
+        fail_msg: >-
+          `ufw show added` returned no rules at all. That is either a host with
+          an empty firewall or a failed read, and the two are indistinguishable
+          from here, so this stops rather than deleting on a guess.
+
+    - name: Work out the difference
+      ansible.builtin.set_fact:
+        fw_missing: "{{ fw_want | difference(fw_have) }}"
+        fw_extra: "{{ fw_have | difference(fw_want) }}"
+
+    - name: Show what would change
+      ansible.builtin.debug:
+        msg: >-
+          {{ fw_have | length }} rule(s) on the host, {{ fw_want | length }}
+          declared: {{ fw_missing | length }} to add, {{ fw_extra | length }}
+          to delete.
+          {{ ('ADD: ' ~ (fw_missing | join(' | '))) if fw_missing else '' }}
+          {{ ('DELETE: ' ~ (fw_extra | join(' | '))) if fw_extra else '' }}
+
+    # Add first. See the header: the reverse order has a gap.
+    - name: Add the declared rules that are missing
+      ansible.builtin.command: "{{ item }}"
+      loop: "{{ fw_missing }}"
+      when: not ansible_check_mode
+      changed_when: true
+
+    - name: Delete the rules nobody declared
+      # `ufw delete <rule>` takes the same syntax as the rule itself, which is
+      # why `show added` is the right source: its output IS the delete argument.
+      ansible.builtin.command: "{{ item | regex_replace('^ufw ', 'ufw delete ') }}"
+      loop: "{{ fw_extra }}"
+      when: not ansible_check_mode
+      changed_when: true
+
+    - name: Read the rules back
+      ansible.builtin.command: ufw show added
+      register: fw_after
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Assert the host now matches the declaration
+      # Turning the action into a result: without this the play would report
+      # success for a `ufw` that silently rejected a rule.
+      ansible.builtin.assert:
+        that:
+          - (fw_after.stdout_lines | select('match', '^ufw ') | map('trim') | list
+             | symmetric_difference(fw_want) | length) == 0
+        fail_msg: >-
+          After converging, the host still differs from the declaration.
+          On host: {{ fw_after.stdout_lines | select('match', '^ufw ') | list }}
+          Declared: {{ fw_want }}
+        success_msg: "UFW matches the declaration: {{ fw_want | length }} rule(s)."
+      when: not ansible_check_mode
+
+    - name: Show the running firewall
+      ansible.builtin.command: ufw status verbose
+      register: fw_status
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{{ fw_status.stdout_lines | default(['(check mode: nothing was changed)']) }}"

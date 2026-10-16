@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  role_name: service_deploy
+  author: Niclas Edge
+  license: MIT
+  description: >-
+    Deploys one service from services.yml onto its target host: pre-flight,
+    Traefik collision check, snapshot, acquisition (compose-pull | git-pull |
+    rsync-build), .env, docker compose up, healthcheck, best-effort rollback.
+    Entry point: ansible/playbooks/deploy.yml.
+  min_ansible_version: "2.15"
+dependencies: []

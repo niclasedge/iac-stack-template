@@ -1,0 +1,120 @@
+---
+# Run the alert loop (monitor-check.py) from cron on the log host.
+#
+#   IAC_REPO_URL=<your fork> just monitor-check-cron [--check]
+#
+# monitor-check.py is the alerting loop, not a job: every five minutes it reads
+# level:error documents and missing heartbeats out of Elasticsearch and opens
+# GitHub Issues. It stays in cron rather than in a scheduler on purpose: the
+# thing that detects failures should not depend on the thing that can fail.
+#
+# Run it on a host that is always on. If detection sleeps whenever a laptop
+# does, the alert chain sleeps with it.
+#
+# Preconditions, asserted below instead of failing at 03:00 in a log nobody
+# reads:
+#   - uv and sops are installed in ~/.local/bin (or adjust `local_bin`)
+#   - an age key exists on THIS host (generated here, never copied) and its
+#     public half is in .sops.yaml, so the host can decrypt secrets/app.env
+- name: Run the alert loop from cron
+  hosts: homelab
+  gather_facts: true
+
+  vars:
+    repo_url: "{{ lookup('env', 'IAC_REPO_URL') }}"
+    repo_dir: "{{ ansible_env.HOME }}/iac-stack"
+    local_bin: "{{ ansible_env.HOME }}/.local/bin"
+    age_key: "{{ ansible_env.HOME }}/.config/sops/age/keys.txt"
+    # UUID of a Healthchecks check for this job; empty means no ping. Pass it
+    # with -e rather than committing it.
+    monitor_check_hc_uuid: ""
+
+  tasks:
+    - name: Assert a repository URL was provided
+      ansible.builtin.assert:
+        that: repo_url | length > 0
+        fail_msg: Set IAC_REPO_URL to the git URL of your copy of this repository.
+
+    - name: Assert the toolchain is present
+      ansible.builtin.stat:
+        path: "{{ local_bin }}/{{ item }}"
+      register: tool_stat
+      loop: [uv, sops]
+
+    - name: Fail loudly when a tool is missing
+      ansible.builtin.assert:
+        that: tool_stat.results | map(attribute='stat.exists') | select | list | length == 2
+        fail_msg: >-
+          uv and/or sops missing in {{ local_bin }}. Install them there; see
+          README (Prerequisites).
+
+    - name: Assert this host can decrypt the secrets
+      # The single most important precondition, and the one that fails silently:
+      # without the GitHub token out of secrets/app.env, monitor-check finds its
+      # errors and cannot file a single issue.
+      ansible.builtin.stat:
+        path: "{{ age_key }}"
+      register: age_key_stat
+
+    - name: Fail loudly without an age key
+      ansible.builtin.assert:
+        that: age_key_stat.stat.exists
+        fail_msg: >-
+          No age key at {{ age_key }}. Generate one HERE (never copy a private
+          key onto a host) and add its public half to .sops.yaml, then run
+          `just secrets-updatekeys` and commit; see docs/secrets.md.
+
+    - name: Keep the checkout current
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ repo_dir }}"
+        version: main
+        # Refuse to discard local work rather than resetting over it, same rule
+        # as service_deploy's git-pull pattern.
+        force: false
+      register: repo_state
+
+    - name: Create the cron log directory
+      # cron redirects into it; without it every run loses its output and the
+      # only trace of a failure is the missing Healthchecks ping.
+      ansible.builtin.file:
+        path: "{{ repo_dir }}/monitoring/logs/cron"
+        state: directory
+        mode: "0755"
+
+    - name: Schedule the alert loop
+      # The `cd` is load-bearing: cron starts in $HOME, and every path in the
+      # command (the script, the log, the repo-relative secrets) is resolved
+      # from the working directory.
+      #
+      # The Healthchecks ping hangs off `&&` so it only fires on a zero exit.
+      # monitor-check exits non-zero when it found alerts it could NOT deliver,
+      # so a broken delivery path withholds the heartbeat and Healthchecks
+      # alerts about the alert chain itself.
+      ansible.builtin.cron:
+        name: iac-stack monitor-check
+        minute: "*/5"
+        job: >-
+          cd {{ repo_dir }} && {{ local_bin }}/uv run monitoring/scripts/monitor-check.py
+          >> monitoring/logs/cron/monitor-check.log 2>&1
+          {% if monitor_check_hc_uuid | length > 0 %}
+          && /usr/bin/curl -fsS -m 10 -o /dev/null {{ healthchecks_url }}/ping/{{ monitor_check_hc_uuid }}
+          {% endif %}
+
+    - name: Run it once under cron's own environment
+      # `env -i PATH=/usr/bin:/bin` is the only honest test. In an interactive
+      # shell ~/.local/bin is on the PATH and every binary resolves, which is
+      # precisely why bare-binary bugs survive so long.
+      ansible.builtin.shell:
+        cmd: >-
+          cd {{ repo_dir }} &&
+          env -i PATH=/usr/bin:/bin HOME={{ ansible_env.HOME }}
+          {{ local_bin }}/uv run monitoring/scripts/monitor-check.py
+      register: probe_run
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          monitor-check runs on {{ inventory_hostname }} under a cron-like
+          environment. Last line: {{ probe_run.stdout_lines | last | default('') | trim }}

@@ -1,0 +1,20 @@
+# Smallest routed service: replies with the request headers.
+# The Host() rule must equal the resolved domain in services.yml
+# (domain `whoami` + domain_suffix `example.com`).
+
+services:
+  whoami:
+    image: traefik/whoami:v1.10
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami.rule=Host(`whoami.example.com`)
+      - traefik.http.routers.whoami.entrypoints=websecure
+      - traefik.http.routers.whoami.tls.certresolver=letsencrypt
+      - traefik.http.services.whoami.loadbalancer.server.port=80
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,93 @@
+---
+# service_deploy — one entry point for every service in services.yml.
+# Only the acquisition step branches; everything else is identical regardless
+# of `deploy:`.
+#
+#   1. Pre-flight    host reachable, target directory present, `proxy` network
+#   2. Traefik check resolved domain(s) must not collide with a running container
+#   3. Snapshot      back up what the acquisition is about to overwrite
+#   4. Acquisition   BRANCHES on `service_deploy`: compose-pull | git-pull | rsync-build
+#   5. .env          rendered from encrypted secrets or a template, AFTER
+#                    acquisition on purpose: `git clone` refuses a non-empty
+#                    directory, so a freshly rendered .env would break the very
+#                    first git-pull deploy of a service
+#   6. compose up    `docker compose up -d --build`, identical for every pattern
+#   7. Healthcheck   against `service_health` if set, else container state
+#   8. Rollback      best-effort, only entered when 3-7 fail (block/rescue)
+#
+# Where the files come from
+# -------------------------
+# The controller-side source for compose-pull and rsync-build is
+# `services/<name>/` in this repository (sd_local_dir). git-pull is the one
+# pattern that does not move files from the controller: the target clones
+# `service_repo` itself.
+#
+# A service's directory on the target is not always its name: `service_path`
+# (`path:` in services.yml) replaces the name segment, for nested directories.
+# Only sd_remote_dir follows `path`; sd_local_dir does not.
+#
+# sd_project is the BASENAME of the target directory, not the service name.
+# Docker derives a compose project name from the directory, so using the
+# directory keeps a deploy adopting the running stack instead of starting a
+# second one beside it that collides on ports. The regex mirrors Docker's own
+# sanitizing ([a-z0-9_-] only).
+
+- name: Assert the required inputs are present
+  ansible.builtin.assert:
+    that:
+      - service_name is defined and service_name | length > 0
+      - service_host is defined and service_host | length > 0
+      - service_state is defined and service_state | length > 0
+      - service_base_dir is defined and service_base_dir | length > 0
+    fail_msg: >-
+      service_deploy needs service_name/service_host/service_state/service_base_dir
+      — set by ansible/playbooks/deploy.yml, not meant to be called standalone.
+
+- name: Resolve the directory segment this service occupies on the target
+  ansible.builtin.set_fact:
+    sd_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    # `path:` replaces the name segment, it is not appended to it.
+    sd_dir_segment: "{{ service_path | default(service_name, true) }}"
+
+- name: Compute remote/local directories and the Compose project name
+  ansible.builtin.set_fact:
+    sd_remote_dir: >-
+      {{ (service_base_dir_override if (service_base_dir_override | default('', true) | length > 0) else service_base_dir) }}/{{ sd_dir_segment }}
+    # Flat on purpose: services/<name>, never nested.
+    sd_local_dir: "{{ sd_repo_root }}/services/{{ service_name }}"
+    sd_project: "{{ sd_dir_segment | basename | lower | regex_replace('[^a-z0-9_-]', '-') }}"
+
+# The one line worth having in every run log: which directory on which host
+# this deploy touches, and under which compose project name.
+- name: Show the resolved deploy target
+  ansible.builtin.debug:
+    msg: >-
+      {{ service_name }} → {{ service_host }}:{{ sd_remote_dir }}
+      (compose project '{{ sd_project }}', file '{{ service_compose_file }}')
+
+- name: Step 1 — pre-flight
+  ansible.builtin.include_tasks: preflight.yml
+
+- name: Step 2 — Traefik label collision check
+  ansible.builtin.include_tasks: traefik-check.yml
+  when: (service_domain | default('', true)) | length > 0
+
+- name: Steps 3-7 — snapshot, acquire, configure, start, verify (rolled back together on failure)
+  block:
+    - name: Step 3 — snapshot the current deploy directory before touching it
+      ansible.builtin.include_tasks: snapshot.yml
+
+    - name: Step 4 — acquisition ({{ service_deploy }})
+      ansible.builtin.include_tasks: "acquire-{{ service_deploy }}.yml"
+
+    - name: Step 5 — .env
+      ansible.builtin.include_tasks: env-file.yml
+
+    - name: Step 6 — docker compose up
+      ansible.builtin.include_tasks: compose-up.yml
+
+    - name: Step 7 — post-deploy healthcheck
+      ansible.builtin.include_tasks: healthcheck.yml
+  rescue:
+    - name: Step 8 — rollback
+      ansible.builtin.include_tasks: rollback.yml

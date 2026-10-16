@@ -1,0 +1,40 @@
+# SOPS creation rules: who can decrypt what.
+#
+# Everything under secrets/ is a dotenv file: SOPS encrypts the VALUES and
+# leaves the keys in plaintext, so a diff still shows which variable changed
+# without revealing what it changed to.
+#
+# THIS FILE IS AN EXAMPLE. The recipient below is a placeholder and not a valid
+# age key: replace it with the public key(s) of your machines before creating
+# secrets/app.env. See docs/secrets.md for the full walk-through:
+#
+#     age-keygen -o ~/.config/sops/age/keys.txt     # prints the public key
+#     # paste the public key (age1...) below, then:
+#     cp secrets/example.env secrets/app.env
+#     sops --encrypt --in-place secrets/app.env
+#
+# Adding a machine means adding its age public key below and then running
+#
+#     just secrets-updatekeys
+#
+# which re-encrypts the data key to the new recipient set. Adding a key here
+# does NOT re-encrypt anything by itself: until you run it and commit, the new
+# machine is still locked out, and nothing says so.
+#
+# The private keys live in ~/.config/sops/age/keys.txt (Linux) and are never
+# committed. Back them up (password manager); losing every copy means losing
+# every secret, because the encrypted file has no other way in.
+#
+# SOPS does not find the key on every platform by itself (macOS looks in
+# ~/Library/Application Support/sops/age/keys.txt). The key is named through
+# SOPS_AGE_KEY_CMD, pointed at scripts/age-key.sh by ./j and the justfile.
+
+keys:
+  # Replace with your own public key. `age1` + 58 characters.
+  - &workstation age1replacewithyourownpublickeyfromagekeygen000000000000000000000
+
+creation_rules:
+  - path_regex: ^secrets/.*\.env$
+    key_groups:
+      - age:
+          - *workstation

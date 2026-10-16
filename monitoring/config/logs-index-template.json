@@ -1,0 +1,28 @@
+{
+  "index_patterns": [
+    "logs-*"
+  ],
+  "template": {
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "strings_as_keyword": {
+            "mapping": {
+              "type": "keyword"
+            },
+            "match_mapping_type": "string",
+            "match": "level|service|event|status"
+          }
+        }
+      ]
+    }
+  },
+  "composed_of": [],
+  "priority": 500,
+  "_meta": {
+    "managed_by": "ansible/playbooks/runbooks/monitoring_stack.yml",
+    "purpose": "Force level/service/event/status to keyword. monitor-check.py queries level.keyword:error; on a text mapping that query matches nothing, which reads as 'all clear' rather than as a broken index.",
+    "filebeat_does_not_create_it": "filebeat.yml sets setup.template.enabled: false on purpose, so this must be applied to Elasticsearch separately.",
+    "caveat": "A template only affects indices created after it. An existing index keeps its mapping; delete or reindex it if existing data matters."
+  }
+}

@@ -1,0 +1,69 @@
+---
+# The host's .env. Two sources, and `env_from_secrets` wins.
+#
+# The map in services.yml renders straight from the encrypted secrets file and
+# skips the template entirely. That is how a service stops INVENTING its
+# secrets on the host: `lookup('password', ...)` inside a .env.j2 keeps no copy
+# anywhere else, so the value would live only in the rendered file. Reading
+# them instead makes the encrypted file the source of truth and the host file a
+# derived artefact: a rebuilt host comes back with the SAME credentials
+# instead of rotating them out from under a running volume.
+#
+# Re-rendered on every deploy, unconditionally: there is no generated value
+# left to preserve, and drift on the host is exactly what this removes. A
+# missing key is a hard error from the sops_dotenv lookup, never an empty
+# string: an empty password renders a valid-looking .env and breaks the stack
+# on its next start.
+- name: Render .env from the encrypted secrets (services.yml env_from_secrets)
+  ansible.builtin.copy:
+    dest: "{{ sd_remote_dir }}/.env"
+    mode: "0600"
+    content: |
+      # Rendered by service_deploy from the repo's encrypted secrets.
+      # Do not edit here — the next deploy overwrites it. Use `just secrets-edit`.
+      {% for var, ref in service_env_from_secrets.items() %}
+      {#- `[<file>:]<KEY>`, split at the LAST colon: a dotenv key contains
+          none, so this is unambiguous, and a reference without a file keeps
+          the default of secrets/app.env. The grammar is enforced by
+          scripts/validate_services.py, not here. -#}
+      {% set parts = ref.split(':') %}
+      {{ var }}={{ lookup('sops_dotenv', parts[-1],
+                          file=(parts[:-1] | join(':')) or 'secrets/app.env') }}
+      {% endfor %}
+  no_log: true
+  when: service_env_from_secrets | length > 0
+
+# .env from a template checked into the service's directory
+# (services/<name>/.env.j2), rendered once and never overwritten afterwards:
+# secrets generated inside the template (lookup('password', ...)) must survive
+# every redeploy. Uniform across all three deploy patterns.
+#
+# No template found means no .env managed here, which is not a failure: many
+# services need none.
+- name: Check for a .env template in the service directory
+  ansible.builtin.stat:
+    path: "{{ sd_local_dir }}/.env.j2"
+  register: sd_env_template
+  delegate_to: localhost
+  check_mode: false
+  when: service_env_from_secrets | length == 0
+
+- name: Check whether .env already exists on the target
+  ansible.builtin.stat:
+    path: "{{ sd_remote_dir }}/.env"
+  register: sd_env_remote
+  when: sd_env_template.stat.exists | default(false)
+
+# Default: first deploy only, because a template that GENERATES its secrets
+# must not rotate them on every run. `env_rerender: true` in services.yml flips
+# this for templates that are a pure projection of the controller's
+# environment: there the controller value is the source of truth and every
+# deploy must carry the current one to the host.
+- name: Render .env from template (first deploy only, unless env_rerender)
+  ansible.builtin.template:
+    src: "{{ sd_local_dir }}/.env.j2"
+    dest: "{{ sd_remote_dir }}/.env"
+    mode: "0600"
+  when:
+    - sd_env_template.stat.exists | default(false)
+    - (service_env_rerender | bool) or (not sd_env_remote.stat.exists)

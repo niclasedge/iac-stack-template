@@ -1,0 +1,19 @@
+# gitleaks config: run it before every push (`gitleaks dir .`) or from a
+# pre-commit hook.
+#
+# useDefault keeps gitleaks' full built-in ruleset; everything below only adds
+# exceptions on top of it.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Files that are supposed to contain secret-shaped strings"
+paths = [
+  # Key names and placeholder values only: the documentation of what
+  # secrets/app.env must contain. A real value in here is the bug, and it is
+  # caught by review, not by entropy: placeholders look exactly like the thing
+  # they stand for.
+  '''^secrets/example\.env$''',
+  '''^\.env\.example$''',
+]

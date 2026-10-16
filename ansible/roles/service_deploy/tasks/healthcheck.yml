@@ -1,0 +1,71 @@
+---
+# Post-deploy healthcheck against `service_health` (an HTTP path on the
+# resolved public domain); falls back to a container-state check when the
+# service defines no health endpoint (`health:` is optional in services.yml,
+# validate_services.py only requires a domain when `health:` is set).
+#
+# The URL check goes through the public domain, not a local container port.
+# That is the point: it proves compose -> Traefik -> DNS/TLS works end to end.
+- name: Wait for the health endpoint to answer
+  ansible.builtin.uri:
+    url: "https://{{ service_domain }}{{ service_health }}"
+    method: GET
+    status_code: [200, 201, 204]
+  register: sd_health
+  retries: 12
+  delay: 5
+  until: sd_health.status is defined and sd_health.status in [200, 201, 204]
+  delegate_to: localhost
+  when:
+    - (service_health | default('', true)) | length > 0
+    - not ansible_check_mode
+
+- name: List container IDs of the compose project (no health endpoint defined)
+  ansible.builtin.command:
+    cmd: docker compose -p {{ sd_project }} -f "{{ service_compose_file }}" ps -q
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_ps
+  changed_when: false
+  when:
+    - (service_health | default('', true)) | length == 0
+    - not ansible_check_mode
+
+- name: Check each container is running
+  ansible.builtin.command:
+    cmd: docker inspect -f '{{ '{{' }}.State.Running{{ '}}' }}' {{ item }}
+  loop: "{{ sd_ps.stdout_lines | default([]) }}"
+  register: sd_container_states
+  changed_when: false
+  when:
+    - (service_health | default('', true)) | length == 0
+    - not ansible_check_mode
+    - sd_ps is not skipped
+
+- name: Assert every container of the compose project is running
+  ansible.builtin.assert:
+    that:
+      # "Every container is running" is trivially true when there are NO
+      # containers: an empty list survives rejectattr with length 0 and the
+      # assert goes green. That is the state a deploy may have just produced
+      # (`up -d` that started nothing), and it is a failure, so say so.
+      - (sd_ps.stdout_lines | default([]) | length) > 0
+      - >-
+        (sd_container_states.results | default([])
+         | rejectattr('stdout', 'equalto', 'true') | list | length) == 0
+    fail_msg: >-
+      {{ "'" ~ service_name ~ "' has NO running containers after the deploy —
+      `docker compose -p " ~ sd_project ~ " ps` on " ~ service_host ~ " is empty.
+      The stack did not come up."
+      if (sd_ps.stdout_lines | default([]) | length) == 0
+      else "Not every container of '" ~ service_name ~ "' reports Running=true
+      after deploy — see `docker compose -p " ~ sd_project ~ " ps` on "
+      ~ service_host ~ "." }}
+  when:
+    - (service_health | default('', true)) | length == 0
+    - not ansible_check_mode
+    - sd_ps is not skipped
+
+- name: Report health status (check mode)
+  ansible.builtin.debug:
+    msg: "--check: skipping health verification — no real containers were started."
+  when: ansible_check_mode

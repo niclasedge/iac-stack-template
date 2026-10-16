@@ -1,0 +1,102 @@
+# =============================================================================
+# Filebeat configuration — log shipper for the Elastic stack
+# =============================================================================
+# Reads from two sources:
+#   1. Docker container logs (/var/lib/docker/containers/*/*.log)
+#   2. Structured result logs (./logs/*.log, mounted at /logs)
+#
+# Output: Elasticsearch index logs-{yyyy.MM.dd}
+
+filebeat.inputs:
+  - type: filestream
+    id: docker-logs
+    enabled: true
+    paths:
+      - /var/lib/docker/containers/*/*.log
+    parsers:
+      - container: {}
+
+  # Result logs are identified by PATH, because here the inode is not a safe
+  # identity and the content is not unique.
+  #
+  # filestream's default `native` identity is inode+device. On bind mounts
+  # through some virtual filesystems (macOS container runtimes, for example)
+  # inodes are recycled within days, so a fresh small result log that lands on
+  # a recycled inode resumes at the PREVIOUS file's byte offset: Filebeat starts
+  # reading in the middle of a JSON line, ndjson throws, and `add_error_key`
+  # files the fragment away as a document with an `error.message` and no
+  # `service`, invisible to monitor-check, while every job still reports
+  # success.
+  #
+  # `fingerprint` is Elastic's general answer and the wrong one for this
+  # directory: it hashes the first N bytes, and two result logs written in the
+  # same second by the same job for two hosts can be byte-identical that far
+  # in, so one would be skipped as a duplicate. Raising N trades one silent
+  # skip for another (a file shorter than N is ignored until it grows, and
+  # these files never grow).
+  #
+  # `path` has neither failure mode: every producer writes one file named
+  # `<job>_<host>_<UTC timestamp>.log` and never appends, renames or rotates
+  # it, so the path IS the unique identity. The usual warning against `path`
+  # identity is about rotated logs, which these are not.
+  - type: filestream
+    id: script-logs-path
+    enabled: true
+    paths:
+      - /logs/*.log
+    file_identity.path: ~
+    # `ignore_older` is the outage bound, not a scan optimisation: a file older
+    # than this is never harvested, so it also caps how much a Filebeat that was
+    # down catches up on. 48 h is generous for write-once logs that are normally
+    # picked up within seconds. `clean_inactive` must stay above it, otherwise
+    # the cursor is dropped while the file is still eligible and gets re-read.
+    ignore_older: 48h
+    clean_inactive: 72h
+    parsers:
+      - ndjson:
+          overwrite_keys: true
+          add_error_key: true
+          target: ""
+
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+  - add_docker_metadata:
+      host: "unix:///var/run/docker.sock"
+  # Drop the monitoring stack's own container logs: they are infrastructure
+  # noise (ES/Kibana/Filebeat chatter), not observed workload. Keeps the index
+  # to structured app and runbook logs.
+  - drop_event:
+      when:
+        or:
+          - equals: {container.name: "iac-es"}
+          - equals: {container.name: "iac-kibana"}
+          - equals: {container.name: "iac-filebeat"}
+  - timestamp:
+      field: "@timestamp"
+      layouts:
+        - "2006-01-02T15:04:05Z"
+        - "2006-01-02T15:04:05.000Z"
+        - "2006-01-02T15:04:05-07:00"
+        - "2006-01-02T15:04:05.000-07:00"
+        - "2006-01-02 15:04:05"
+      test:
+        - "2024-01-01T12:00:00Z"
+  - drop_fields:
+      fields: ["host.os", "host.architecture"]
+      ignore_missing: true
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  index: "logs-%{+yyyy.MM.dd}"
+
+# The index template is managed separately
+# (monitoring/config/logs-index-template.json, applied by
+# runbooks/monitoring_stack.yml).
+setup.template.enabled: false
+setup.ilm.enabled: false
+
+# Filebeat's own logging
+logging.level: info
+logging.to_files: false
+logging.metrics.enabled: false

@@ -1,0 +1,77 @@
+---
+# import_playbook is a playbook-level statement, not a task action:
+# using it inside `tasks:` fails with "does not support raw params".
+- import_playbook: test_connectivity.yml
+- import_playbook: check_services.yml
+- import_playbook: check_host_config.yml
+- import_playbook: check_cron_health.yml
+
+# Aggregates the facts set by the four imported playbooks' own "Report ..."
+# plays (down_hosts/disk_alerts/cron_alerts on hostvars['localhost'],
+# missing_containers per host) into a single event:result summary line for
+# the "daily_health_check" job. Facts set in earlier plays of this same
+# ansible-playbook run stay visible in hostvars for the rest of the run.
+- name: Aggregate daily health check result
+  hosts: localhost
+  gather_facts: no
+  vars:
+    hc_uuid: ""
+  tasks:
+    - name: Collect aggregate facts from imported checks
+      set_fact:
+        dhc_down_hosts: "{{ hostvars['localhost']['down_hosts'] | default([]) }}"
+        dhc_disk_alerts: "{{ hostvars['localhost']['disk_alerts'] | default([]) }}"
+        dhc_cron_alerts: "{{ hostvars['localhost']['cron_alerts'] | default([]) }}"
+      failed_when: false
+
+    - name: Count missing containers across hosts
+      set_fact:
+        dhc_missing_containers_count: >-
+          {{ (dhc_missing_containers_count | default(0) | int) +
+             (hostvars[item]['missing_containers'] | default([]) | length) }}
+      loop: "{{ groups['all'] }}"
+      failed_when: false
+
+    - name: Build daily health check result message
+      set_fact:
+        # Every continuation stays at the block's own indent. A more-indented
+        # line in a `>-` scalar is kept verbatim, newline and all, which would
+        # put a literal line break into every alert message: harmless in the
+        # JSON but it breaks grepping the log.
+        dhc_message: >-
+          {{ dhc_down_hosts | length }} hosts down{{
+          ' (' ~ (dhc_down_hosts | join(', ')) ~ ')' if dhc_down_hosts | length > 0 else '' }} ·
+          {{ dhc_disk_alerts | length }} disk warnings ·
+          {{ dhc_cron_alerts | length }} cron warnings ·
+          {{ dhc_missing_containers_count | default(0) }} missing containers
+      failed_when: false
+
+    - name: Write structured result log
+      # Filebeat only reads es_log_dir on the log host, see group_vars/all
+      delegate_to: "{{ es_log_host }}"
+      copy:
+        dest: "{{ es_log_dir }}/result_daily_health_check_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.log"
+        content: >
+          {"@timestamp":"{{ lookup('pipe', 'date -u +%FT%TZ') }}",
+          "service":"daily_health_check",
+          "level":"{{ 'error' if (dhc_down_hosts | length > 0) or (dhc_disk_alerts | length > 0) or (dhc_cron_alerts | length > 0) else 'info' }}",
+          "event":"result",
+          "message":{{ dhc_message | to_json }}}
+      failed_when: false
+
+  post_tasks:
+    # Pass the check's UUID with `-e hc_uuid=<uuid>`; empty means no ping.
+    #
+    # Success only, and deliberately no /fail counterpart: there is no payload
+    # rc here, just four imported check playbooks. Findings are not job
+    # failures: they travel through the level:error result log above. If the
+    # run dies, this task is simply never reached and Healthchecks reports down
+    # once the grace period expires, which is what the check is for.
+    - name: Ping healthcheck success
+      uri:
+        url: "{{ healthchecks_url }}/ping/{{ hc_uuid }}"
+        method: GET
+        timeout: 10
+      run_once: true
+      when: hc_uuid | length > 0
+      ignore_errors: yes

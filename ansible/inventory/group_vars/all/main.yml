@@ -1,0 +1,61 @@
+---
+# Group variables for all hosts. Sensitive values come from the environment
+# (secrets/app.env through ./j), never from this file.
+
+ansible_timeout: 30
+
+# Dead man's switch for scheduled jobs: Healthchecks.io-style ping URLs.
+# Self-hosted Healthchecks works the same way. Leave `hc_uuid` empty and the
+# job simply does not ping.
+healthchecks_url: "{{ lookup('env', 'HEALTHCHECKS_URL') | default('https://hc-ping.com', true) }}"
+
+# Where a play writes its structured result log. Default is the controller's
+# IAC_LOG_DIR (exported by the justfile). Plays that write to the log host say
+# `delegate_to: "{{ es_log_host }}"`, see below.
+log_output_dir: "{{ lookup('env', 'IAC_LOG_DIR') | default('./logs', true) }}"
+
+# The host that runs Filebeat, i.e. the single entry point into
+#   logs-* -> Elasticsearch -> monitor-check.py -> GitHub Issue.
+#
+# Named rather than hardcoded so that moving the Elastic stack is one line here
+# instead of an edit in every playbook. Every task that writes a structured
+# result log says `delegate_to: "{{ es_log_host }}"`, which is a no-op when the
+# controller is that host and an SSH hop otherwise.
+#
+# Do NOT point this at a host without Filebeat. The failure is silent: the file
+# is written, the play stays green, and the document never reaches
+# Elasticsearch, so monitor-check never sees it and no issue is raised.
+es_log_host: home-server
+
+# Filebeat's ingest directory ON THAT HOST. Result logs must land here and
+# nowhere else. hostvars, not the group var itself: this has to resolve from
+# plays that do not include the log host at all (`hosts: localhost` report
+# plays).
+es_log_dir: "{{ hostvars[es_log_host].log_output_dir }}"
+
+# Base directory the service_deploy role deploys under:
+#   {{ service_base_dir }}/<service name or path:>
+# Override per group or per host.
+service_base_dir: /home/deploy/apps
+
+# Optional environment for tasks on hosts whose non-interactive SSH PATH lacks
+# the docker binary (typical for macOS: /usr/local/bin is not on the PATH of
+# an SSH command). Empty by default, so Linux hosts are untouched. Example for
+# a Mac host, in its group_vars:
+#   deploy_environment:
+#     PATH: "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+deploy_environment: {}
+
+# Expected containers per host, compared against `docker ps` by
+# checks/check_services.yml. Declare them per group or host, for example:
+#   expected_containers: [traefik, whoami]
+expected_containers: []
+
+# Monitoring thresholds for checks/check_host_config.yml.
+#
+# 95 and not a lower number on purpose: an alert that fires daily about a
+# condition nobody is going to act on is an alert people learn to close unread.
+# Pick the value where somebody really has to act, and remember that this
+# alert is the only channel for disk usage.
+disk_threshold_percent: 95
+memory_threshold_percent: 90

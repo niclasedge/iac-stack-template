@@ -1,0 +1,49 @@
+# ansible-lint config (see `just lint`).
+#
+# profile: basic keeps syntax-check active (unskippable in ansible-lint
+# anyway) plus the low-noise basic-profile rules. Everything below is a
+# deliberate, commented skip, not a blanket relaxation.
+profile: basic
+
+skip_list:
+  # Bare module names instead of FQCNs in the older-style check playbooks.
+  # Rewriting them is mechanical, with regression risk and a style-only gain.
+  - fqcn[action-core]
+
+  # `yes`/`no` booleans in the check playbooks; bulk-rewriting is churn without
+  # behavior change.
+  - yaml[truthy]
+
+  # Long lines in templated `content:` blocks. Splitting a one-line JSON result
+  # log would break the "one line per result" contract the log shipper needs.
+  - yaml[line-length]
+
+  # `run_once` on delegated report plays is intentional: one result log per run.
+  - run-once[task]
+
+  # Play/task names use Jinja templating on purpose, e.g. deploy.yml's
+  # `Deploy {{ service_name }}`: that IS the point (it shows which service is
+  # being deployed), not a naming mistake to fix.
+  - name[template]
+  - name[play]
+
+  # roles/service_deploy uses `sd_` as its var prefix throughout instead of
+  # `service_deploy_`. `sd_` collides with nothing else in this repo.
+  - var-naming[no-role-prefix]
+
+  # roles/service_deploy uses `command: rsync` (not ansible.posix.synchronize)
+  # on purpose: synchronize has known problems combined with delegate_to/become,
+  # which this role relies on.
+  - command-instead-of-module
+
+  # Some `shell:` tasks need the shell (pipes, `||`, redirects); a few are plain
+  # binaries. The mix is why this stays a commented skip rather than a
+  # mechanical fix.
+  - command-instead-of-shell
+
+  # `!= true` literal compare in checks/test_connectivity.yml: trivial in
+  # isolation, kept for readability next to the `default(false)`.
+  - literal-compare
+
+# syntax-check is intentionally NOT in this list. It is ansible-lint's
+# unskippable "does this even run" gate and must stay able to fail the build.

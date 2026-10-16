@@ -1,0 +1,56 @@
+---
+- name: Test connectivity to all hosts
+  hosts: all
+  gather_facts: yes
+  ignore_unreachable: true
+  tasks:
+    - name: Ping host
+      ping:
+      register: ping_result
+      ignore_unreachable: true
+
+    - name: Show system info
+      debug:
+        msg: >
+          Host: {{ inventory_hostname }}
+          ({{ host_prefix }}) |
+          OS: {{ ansible_distribution | default('unknown') }}
+          {{ ansible_distribution_version | default('') }} |
+          Kernel: {{ ansible_kernel | default('unknown') }} |
+          Uptime: {{ ansible_uptime_seconds | default(0) | int // 3600 }}h
+
+    - name: Set host reachable fact
+      set_fact:
+        host_reachable: "{{ not (ping_result.unreachable | default(false)) }}"
+
+- name: Report connectivity status
+  hosts: localhost
+  gather_facts: no
+  vars:
+    log_file: "{{ es_log_dir }}/connectivity_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.log"
+  tasks:
+    - name: Find unreachable hosts
+      set_fact:
+        down_hosts: []
+
+    - name: Collect unreachable hosts
+      set_fact:
+        down_hosts: "{{ down_hosts + [item] }}"
+      loop: "{{ groups['all'] }}"
+      when: hostvars[item]['host_reachable'] | default(false) != true
+
+    - name: Show status
+      debug:
+        msg: "{{ 'All hosts reachable' if down_hosts | length == 0 else 'UNREACHABLE: ' + down_hosts | join(', ') }}"
+
+    - name: Write structured log
+      # Filebeat only reads es_log_dir on the log host, see group_vars/all
+      delegate_to: "{{ es_log_host }}"
+      copy:
+        dest: "{{ log_file }}"
+        content: >
+          {"@timestamp":"{{ lookup('pipe', 'date -u +%FT%TZ') }}",
+          "service":"connectivity-check","level":"{{ 'error' if down_hosts | length > 0 else 'info' }}",
+          "event":"connectivity","message":"{{ 'UNREACHABLE: ' ~ down_hosts | join(', ') if down_hosts | length > 0 else 'All hosts reachable' }}",
+          "hosts_down":"{{ down_hosts | join(',') }}","total_hosts":"{{ groups['all'] | length }}"}
+      when: log_file is defined

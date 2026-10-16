@@ -1,0 +1,35 @@
+---
+# Step 1 — pre-flight: host reachable, target directory present, `proxy`
+# network present. Read-only checks run with check_mode: false so `--check`
+# still reports real reachability instead of silently skipping; the one
+# mutating task (network create) is guarded against ansible_check_mode.
+- name: Ping {{ service_host }}
+  ansible.builtin.ping:
+
+- name: Ensure the service directory exists on the target
+  # owner+become: a failed deploy's rollback rsync runs as root and can leave
+  # the service dir root-owned; the next deploy's copy step would then fail
+  # with "Destination not writable". Setting the owner here heals that before
+  # anything is copied.
+  ansible.builtin.file:
+    path: "{{ sd_remote_dir }}"
+    state: directory
+    owner: "{{ ansible_user }}"
+    mode: "0755"
+  become: true
+
+- name: Check whether the `proxy` Docker network exists
+  ansible.builtin.command:
+    cmd: docker network inspect proxy
+  register: sd_proxy_network
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Create the `proxy` Docker network
+  ansible.builtin.command:
+    cmd: docker network create proxy
+  when:
+    - sd_proxy_network.rc != 0
+    - not ansible_check_mode
+  changed_when: true

@@ -1,0 +1,131 @@
+---
+# Acquisition pattern: git-pull — the TARGET clones/pulls service_repo
+# directly; no controller-side copy is involved.
+#
+# `force: false` below is deliberate: a checkout that carries local
+# modifications is never overwritten. The git module hard-fails in that case,
+# including under --check, which would make `just deploy-check` useless for
+# exactly the services that need it most. So the checkout is inspected first:
+# in a dry run the diagnosis IS the useful answer ("this would be blocked, here
+# is what stands in the way"), while a real run still fails.
+- name: Fail fast if `repo` is missing
+  ansible.builtin.assert:
+    that: (service_repo | default('', true)) | length > 0
+    fail_msg: >-
+      deploy: git-pull requires `repo:` in services.yml for '{{ service_name }}'
+      (the schema validator enforces this statically — this is the same rule,
+      checked again here).
+
+- name: Look for an existing checkout on the target
+  ansible.builtin.stat:
+    path: "{{ sd_remote_dir }}/.git"
+  register: sd_git_dir
+  check_mode: false
+
+# Two numbers, one call: uncommitted files and commits that exist only here.
+# Both are ways to lose work, and neither is visible from the controller.
+#
+# `set -euo pipefail` plus a separate assignment is what makes the ZERO
+# trustworthy. Written as one `printf` with inline substitutions, a failing
+# `git status` (dubious ownership, a repo owned by another user) would still
+# leave `wc -l` printing 0 and printf exiting 0: the checkout would be
+# classified CLEAN. With pipefail the failure propagates and the task fails,
+# which is the honest answer: "cannot tell" must not read as "nothing to lose".
+# bash explicitly, because /bin/sh is dash on Debian and has no pipefail.
+#
+# The `|| echo 0` on the second line stays: no upstream branch is a legitimate
+# state, not an error.
+- name: Count uncommitted changes and unpushed commits in that checkout
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      dirty=$(git status --porcelain | wc -l | tr -d ' ')
+      unpushed=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+      printf '%s %s' "$dirty" "$unpushed"
+    executable: /bin/bash
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_git_state
+  changed_when: false
+  check_mode: false
+  when: sd_git_dir.stat.exists
+
+- name: Classify the checkout
+  ansible.builtin.set_fact:
+    sd_git_dirty: "{{ (sd_git_state.stdout | default('0 0')).split()[0] | int }}"
+    sd_git_unpushed: "{{ (sd_git_state.stdout | default('0 0')).split()[1] | int }}"
+
+# `force: false` does NOT cover unpushed commits. `version: main` resolves in
+# the git module to `checkout --force main` followed by `reset --hard
+# origin/main`, while the force guard only inspects `git status --porcelain`.
+# So a dirty tree fails loudly and a local commit is erased in silence, which
+# is the worse of the two.
+#
+# Same rule as a dirty tree, therefore: reported in a dry run, refused in a
+# real one. Both counts are named in one message so the dry run cannot come
+# back green for a condition the real run aborts on.
+- name: Report the blocked acquisition instead of failing the dry run
+  ansible.builtin.debug:
+    msg: >-
+      --check: git-pull would ABORT for '{{ service_name }}' —
+      {{ sd_git_dirty }} uncommitted change(s) and {{ sd_git_unpushed }} unpushed
+      commit(s) in {{ sd_remote_dir }}. Neither is overwritten by force=no; the
+      commits would be destroyed by the `reset --hard origin/main` that git-pull
+      performs. Fix on {{ service_host }}: push them (`git pull --rebase && git push`), and
+      commit or discard the changes. Runtime state tracked in the repo
+      (databases, caches) makes the dirty half permanent: untrack it there.
+  when:
+    - ansible_check_mode
+    - (sd_git_dirty | int > 0) or (sd_git_unpushed | int > 0)
+
+- name: Refuse to reset away commits that exist only on the target
+  ansible.builtin.fail:
+    msg: >-
+      git-pull ABORTED for '{{ service_name }}': {{ sd_git_unpushed }} commit(s)
+      in {{ sd_remote_dir }} are not on {{ service_repo }} and exist nowhere
+      else. Pulling would reset them away without a word. Push them from
+      {{ service_host }} first (`git pull --rebase && git push`), then deploy.
+  when:
+    - not ansible_check_mode
+    - sd_git_unpushed | int > 0
+
+# `git clone` refuses a non-empty destination. The one legitimate way a
+# git-pull target can be non-empty WITHOUT a checkout is a .env that this role
+# rendered earlier (for example restored by a rollback of a first deploy).
+# That .env holds operator-entered secrets, so it is stashed beside the
+# directory and moved back after the clone instead of being deleted and
+# re-rendered. Anything ELSE in a checkout-less directory stays untouched and
+# keeps failing the clone loudly: unknown content is not this role's to sweep
+# aside.
+- name: Check whether a stranded .env is the only thing blocking the first clone
+  ansible.builtin.find:
+    paths: "{{ sd_remote_dir }}"
+    file_type: any
+    hidden: true
+  register: sd_preclone_content
+  check_mode: false
+  when: not sd_git_dir.stat.exists
+
+- name: Stash the stranded .env beside the directory
+  ansible.builtin.command:
+    cmd: mv "{{ sd_remote_dir }}/.env" "{{ sd_remote_dir }}.env.preclone"
+  when:
+    - not ansible_check_mode
+    - not sd_git_dir.stat.exists
+    - (sd_preclone_content.files | default([]) | map(attribute='path') | list)
+      == [sd_remote_dir ~ '/.env']
+  changed_when: true
+
+- name: Clone or update the service repository on the target
+  ansible.builtin.git:
+    repo: "{{ service_repo }}"
+    dest: "{{ sd_remote_dir }}"
+    version: main
+    force: false
+  when: not (ansible_check_mode and ((sd_git_dirty | int > 0) or (sd_git_unpushed | int > 0)))
+
+- name: Restore the stashed .env into the fresh checkout
+  ansible.builtin.command:
+    cmd: mv "{{ sd_remote_dir }}.env.preclone" "{{ sd_remote_dir }}/.env"
+  args:
+    removes: "{{ sd_remote_dir }}.env.preclone"
+  when: not ansible_check_mode

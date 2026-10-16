@@ -1,0 +1,53 @@
+# Example inventory: three hosts that exist only on paper.
+#
+#   edge-vps       a small public VPS (RFC 5737 documentation address)
+#   home-server    an always-on machine at home (RFC 1918 address; on a
+#                  VPN overlay network use its 100.64.0.x address)
+#   workstation    your laptop; it is the Ansible controller (local connection)
+#
+# Copy this file to inventory/inventory.yml (git-ignored) or set the
+# environment variables below, for example in secrets/app.env. Every
+# connection parameter is an env lookup with an example default, so no real
+# address or user name has to be committed.
+#
+# Two conventions the repo relies on:
+#
+#   * A host name must NOT equal a group name ("Found both group and host with
+#     the same name" would fire on every run), hence groups vps/homelab/desktops.
+#   * `hosts: localhost` in a play always means "the controller". The
+#     workstation is therefore NOT called localhost; plays that must run on it
+#     say `hosts: desktops`.
+all:
+  children:
+    vps:
+      hosts:
+        edge-vps:
+          ansible_host: "{{ lookup('env', 'EDGE_VPS_HOST') | default('192.0.2.10', true) }}"
+          ansible_user: "{{ lookup('env', 'EDGE_VPS_USER') | default('deploy', true) }}"
+          ansible_ssh_private_key_file: "{{ lookup('env', 'SSH_KEY_EDGE_VPS') | default(omit, true) }}"
+          ansible_python_interpreter: /usr/bin/python3
+          host_prefix: edge
+
+    homelab:
+      hosts:
+        home-server:
+          ansible_host: "{{ lookup('env', 'HOME_SERVER_HOST') | default('10.0.0.20', true) }}"
+          ansible_user: "{{ lookup('env', 'HOME_SERVER_USER') | default('deploy', true) }}"
+          ansible_ssh_private_key_file: "{{ lookup('env', 'SSH_KEY_HOME_SERVER') | default(omit, true) }}"
+          ansible_python_interpreter: /usr/bin/python3
+          # Only needed when sudo on this host asks for a password. Leave the
+          # variable unset for passwordless sudo.
+          ansible_become_password: "{{ lookup('env', 'HOME_SERVER_BECOME_PASS') | default(omit, true) }}"
+          host_prefix: home
+
+    desktops:
+      hosts:
+        workstation:
+          # `local` as long as you run Ansible from this machine. Another
+          # controller (CI, a scheduler container) sets WORKSTATION_CONNECTION=ssh
+          # plus WORKSTATION_HOST/_USER and reaches it remotely.
+          ansible_connection: "{{ lookup('env', 'WORKSTATION_CONNECTION') | default('local', true) }}"
+          ansible_host: "{{ lookup('env', 'WORKSTATION_HOST') | default('localhost', true) }}"
+          ansible_user: "{{ lookup('env', 'WORKSTATION_USER') | default(lookup('env', 'USER'), true) }}"
+          ansible_python_interpreter: /usr/bin/python3
+          host_prefix: ws

@@ -1,0 +1,78 @@
+---
+- name: Check cron health on all hosts
+  hosts: all
+  gather_facts: no
+  # an unreachable host must not fail the whole run (ansible rc=4)
+  ignore_unreachable: true
+  tasks:
+    - name: Get crontab entries
+      shell: crontab -l 2>/dev/null || echo "no crontab"
+      register: crontab_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Count active cron entries
+      # A job line starts with its schedule field: a digit, '*' or '@reboot'.
+      # Matching that positively also drops environment assignments such as
+      # PATH=/usr/bin, which a naive "not a comment, not blank" filter would
+      # count as jobs.
+      shell: crontab -l 2>/dev/null | grep -cE '^[0-9*@]' || true
+      register: cron_count
+      changed_when: false
+      failed_when: false
+
+    - name: Count commented (disabled) entries
+      shell: crontab -l 2>/dev/null | grep '^#.*\*' | wc -l
+      register: cron_disabled
+      changed_when: false
+      failed_when: false
+
+    - name: Count healthcheck-wrapped entries
+      # A wrapped job pings a dead man's switch (Healthchecks-style): its
+      # crontab line names a ping URL or a wrapper that pings.
+      # Same ^[0-9*@] prefilter as the active count so the two are comparable;
+      # counting commented-out jobs here would make unwrapped go negative.
+      shell: >-
+        crontab -l 2>/dev/null | grep -E '^[0-9*@]'
+        | grep -ciE 'healthcheck|/ping/' || true
+      register: hc_wrappers
+      changed_when: false
+      failed_when: false
+
+    - name: Set cron facts
+      set_fact:
+        active_crons: "{{ cron_count.stdout | default('0') | trim | int }}"
+        hc_wrapped: "{{ hc_wrappers.stdout | default('0') | trim | int }}"
+        unwrapped_count: "{{ (cron_count.stdout | default('0') | trim | int) - (hc_wrappers.stdout | default('0') | trim | int) }}"
+
+    - name: Cron health summary
+      debug:
+        msg: |
+          Host: {{ inventory_hostname }} ({{ host_prefix }})
+          Active: {{ active_crons }} | Disabled: {{ cron_disabled.stdout | default('0') | trim }}
+          HC-wrapped: {{ hc_wrapped }} | Unwrapped: {{ unwrapped_count }}
+
+- name: Report cron health
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Collect cron warnings
+      set_fact:
+        cron_alerts: []
+
+    - name: Gather warnings
+      set_fact:
+        cron_alerts: "{{ cron_alerts + [item ~ ': ' ~ hostvars[item]['unwrapped_count'] ~ ' unwrapped'] }}"
+      loop: "{{ groups['all'] }}"
+      when: hostvars[item]['unwrapped_count'] | default(0) | int > 2
+
+    - name: Write structured cron log
+      # Filebeat only reads es_log_dir on the log host, see group_vars/all
+      delegate_to: "{{ es_log_host }}"
+      copy:
+        dest: "{{ es_log_dir }}/cron_health_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.log"
+        content: >
+          {"@timestamp":"{{ lookup('pipe', 'date -u +%FT%TZ') }}",
+          "service":"cron-health-check","level":"{{ 'error' if cron_alerts | length > 0 else 'info' }}",
+          "event":"cron_health","cron_alerts":{{ cron_alerts | to_json }},
+          "message":"{{ 'Cron warnings: ' ~ cron_alerts | join(', ') if cron_alerts | length > 0 else 'All crons healthy' }}"}

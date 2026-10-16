@@ -1,0 +1,55 @@
+# Feed reader + PostgreSQL. All credentials come from the `.env` next to this
+# file, which service_deploy renders from secrets/app.env (services.yml:
+# env_from_secrets). Nothing secret is written here.
+#
+# The database has no published port and sits on a private network; only the
+# app joins `proxy`. Host() must equal the resolved domain in services.yml
+# (`rss` + `example.com`).
+
+services:
+  miniflux:
+    image: miniflux/miniflux:2.2.1
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://miniflux:${POSTGRES_PASSWORD}@db/miniflux?sslmode=disable
+      RUN_MIGRATIONS: "1"
+      CREATE_ADMIN: "1"
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      BASE_URL: https://rss.example.com
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.miniflux.rule=Host(`rss.example.com`)
+      - traefik.http.routers.miniflux.entrypoints=websecure
+      - traefik.http.routers.miniflux.tls.certresolver=letsencrypt
+      - traefik.http.services.miniflux.loadbalancer.server.port=8080
+    networks:
+      - proxy
+      - backend
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: miniflux
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: miniflux
+    volumes:
+      - miniflux-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "miniflux"]
+      interval: 10s
+      start_period: 30s
+    networks:
+      - backend
+
+networks:
+  proxy:
+    external: true
+  backend:
+
+volumes:
+  miniflux-db:

@@ -1,0 +1,158 @@
+---
+# deploy.yml — entry point for the service_deploy role.
+#
+# Usage:
+#   ansible-playbook ansible/playbooks/deploy.yml -e service=<name> [--check --diff]
+#
+# Reads services.yml from the repo root, merges `defaults` with the named
+# service's own keys (its keys win; `combine` is shallow, which matches
+# scripts/validate_services.py), resolves the target host from `host:` and
+# applies roles/service_deploy there. `state: inactive` is a hard stop: its
+# definition is kept but on purpose never deployed.
+#
+# Two plays: the first (hosts: localhost) resolves and validates the service
+# spec. `hosts: localhost` always means "the controller" in this repo. The
+# second play's `hosts:` is the resolved host name, templated from a fact the
+# first play set on localhost; hostvars stay readable across plays in one run.
+- name: Resolve the requested service from services.yml
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    services_yml_path: "{{ playbook_dir | dirname | dirname }}/services.yml"
+  tasks:
+    - name: Fail fast without -e service=<name>
+      ansible.builtin.assert:
+        that: service is defined and service | length > 0
+        fail_msg: "Usage: ansible-playbook deploy.yml -e service=<name>"
+
+    - name: Fail fast if services.yml is missing
+      ansible.builtin.stat:
+        path: "{{ services_yml_path }}"
+      register: sd_services_yml_stat
+
+    - name: Assert services.yml exists
+      ansible.builtin.assert:
+        that: sd_services_yml_stat.stat.exists
+        fail_msg: "services.yml not found at {{ services_yml_path }}."
+
+    - name: Load services.yml
+      ansible.builtin.set_fact:
+        sd_services_raw: "{{ lookup('file', services_yml_path) | from_yaml }}"
+
+    - name: Fail fast if the service is unknown
+      ansible.builtin.assert:
+        that: service in (sd_services_raw.services | default({}))
+        fail_msg: "'{{ service }}' is not defined under `services:` in {{ services_yml_path }}."
+
+    - name: Merge defaults with the service's own keys
+      # `| default({}, true)` because a services.yml entry can be a bare key
+      # with only a comment — that parses as YAML null, not an empty mapping.
+      ansible.builtin.set_fact:
+        sd_spec: >-
+          {{ (sd_services_raw.defaults | default({}))
+             | combine(sd_services_raw.services[service] | default({}, true)) }}
+
+    - name: Guard — inactive services are never deployed
+      ansible.builtin.assert:
+        that: (sd_spec.state | default('active')) == 'active'
+        fail_msg: >-
+          '{{ service }}' has state: inactive in services.yml — its definition
+          is kept but on purpose never deployed. Flip it to `active` first.
+
+    # Without this the run prints "skipping: no hosts matched" and exits 0 — a
+    # green deploy that deployed nothing. An unknown host must fail loudly.
+    - name: Assert the target host is in the inventory
+      ansible.builtin.assert:
+        that: sd_spec.host in groups['all']
+        fail_msg: >-
+          services.yml sends '{{ service }}' to host '{{ sd_spec.host | default("") }}',
+          which this inventory does not know
+          ({{ groups['all'] | sort | join(', ') }}).
+
+    - name: Resolve the domain to its FQDN
+      # Same rule as scripts/validate_services.py::resolve_domain, and the two
+      # must not diverge: a dot in `domain` means it is already complete.
+      ansible.builtin.set_fact:
+        sd_domain: >-
+          {{ ((sd_spec.domain | default('')) ~ '.' ~ (sd_spec.domain_suffix | default('')))
+             if ((sd_spec.domain | default('') | length > 0)
+                 and (sd_spec.domain_suffix | default('') | length > 0)
+                 and ('.' not in (sd_spec.domain | default(''))))
+             else (sd_spec.domain | default('')) }}
+
+    - name: Resolve alias domains to FQDNs (same dot rule, one alias at a time)
+      ansible.builtin.set_fact:
+        sd_aliases: >-
+          {{ (sd_aliases | default([]))
+             + [ ((item ~ '.' ~ (sd_spec.domain_suffix | default('')))
+                  if ('.' not in item and (sd_spec.domain_suffix | default('') | length > 0))
+                  else item) ] }}
+      loop: "{{ sd_spec.aliases | default([]) }}"
+
+    - name: Store the resolved service spec for the next play
+      ansible.builtin.set_fact:
+        sd_resolved:
+          name: "{{ service }}"
+          host: "{{ sd_spec.host }}"
+          state: "{{ sd_spec.state | default('active') }}"
+          deploy: "{{ sd_spec.deploy | default('compose-pull') }}"
+          repo: "{{ sd_spec.repo | default('') }}"
+          compose_file: "{{ sd_spec.compose_file | default('docker-compose.yml') }}"
+          domain: "{{ sd_domain }}"
+          aliases: "{{ sd_aliases | default([]) }}"
+          health: "{{ sd_spec.health | default('') }}"
+          base_dir: "{{ sd_spec.base_dir | default('') }}"
+          # Replaces the name segment in the target directory (nested dirs).
+          path: "{{ sd_spec.path | default('') }}"
+          # compose-pull only: paths beside the compose file that must travel
+          # to the host. Empty list = compose file alone.
+          sync: "{{ sd_spec.sync | default([]) }}"
+          # Opt-in: re-render .env from .env.j2 on every deploy. Only for
+          # templates that are a pure projection of the controller's
+          # environment (see services.schema.json and env-file.yml).
+          env_rerender: "{{ sd_spec.env_rerender | default(false) }}"
+          # Render .env from an encrypted secrets file instead of .env.j2:
+          # {variable the app expects: '[<file>:]<KEY>'}. Takes precedence over
+          # the template; see roles/service_deploy/tasks/env-file.yml.
+          #
+          # Passed through unsplit on purpose: what the debug task below (and
+          # therefore `./j deploy-check`) prints is exactly what the author
+          # wrote in services.yml. The grammar is checked in
+          # scripts/validate_services.py.
+          env_from_secrets: "{{ sd_spec.env_from_secrets | default({}) }}"
+
+    - name: Report the resolved spec
+      ansible.builtin.debug:
+        var: sd_resolved
+
+- name: Deploy {{ hostvars['localhost'].sd_resolved.name | default('') }}
+  # `default(..., true)` also catches "hostvars itself is undefined", which is
+  # exactly the state --syntax-check parses plays in (no play has run, so no
+  # host has any facts yet) — real runs always have play 1's facts by the time
+  # play 2 starts. Without the default, --syntax-check hard-fails here.
+  hosts: "{{ hostvars['localhost'].sd_resolved.host | default('localhost', true) }}"
+  gather_facts: false
+  vars:
+    service_name: "{{ hostvars['localhost'].sd_resolved.name }}"
+    service_host: "{{ hostvars['localhost'].sd_resolved.host }}"
+    service_state: "{{ hostvars['localhost'].sd_resolved.state }}"
+    service_deploy: "{{ hostvars['localhost'].sd_resolved.deploy }}"
+    service_repo: "{{ hostvars['localhost'].sd_resolved.repo }}"
+    service_compose_file: "{{ hostvars['localhost'].sd_resolved.compose_file }}"
+    service_domain: "{{ hostvars['localhost'].sd_resolved.domain }}"
+    service_aliases: "{{ hostvars['localhost'].sd_resolved.aliases }}"
+    service_health: "{{ hostvars['localhost'].sd_resolved.health }}"
+    service_base_dir_override: "{{ hostvars['localhost'].sd_resolved.base_dir }}"
+    service_path: "{{ hostvars['localhost'].sd_resolved.path }}"
+    service_sync: "{{ hostvars['localhost'].sd_resolved.sync }}"
+    service_env_rerender: "{{ hostvars['localhost'].sd_resolved.env_rerender }}"
+    service_env_from_secrets: "{{ hostvars['localhost'].sd_resolved.env_from_secrets }}"
+  # Optional per-host environment (for example a PATH that includes
+  # /usr/local/bin for non-interactive SSH sessions on macOS); see
+  # group_vars/all/main.yml. It has to be a variable rather than derived from
+  # ansible_env: this play deliberately runs with gather_facts: false, so there
+  # are no facts to derive it from.
+  environment: "{{ deploy_environment | default({}) }}"
+  roles:
+    - service_deploy

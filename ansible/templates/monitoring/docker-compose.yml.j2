@@ -1,0 +1,82 @@
+# Elastic stack on the log host, rendered by
+# ansible/playbooks/runbooks/monitoring_stack.yml. Do not edit on the host.
+#
+# Derived from monitoring/docker-compose.yml (the development variant) with
+# these deliberate differences:
+#
+#   * Ports are bound to {{ es_bind_address | default('127.0.0.1') }}. Elasticsearch runs WITHOUT
+#     authentication (xpack.security.enabled=false), so it must never be
+#     reachable from an untrusted network. Docker writes its port publications
+#     ahead of UFW, so "the firewall will block it" is not a safe assumption:
+#     bind to loopback, or to a private interface address, and nothing else.
+#   * Kibana publishes on loopback only; reach it with an SSH tunnel
+#     (`ssh -L 5601:127.0.0.1:5601 <log-host>`) or put it behind your reverse
+#     proxy with authentication.
+#   * Filebeat's /logs mount is the host side of `es_log_dir` (group_vars/all).
+#
+# Binding a port to a VPN address (for example 100.64.x.x) can lose the host
+# listener while `docker ps` keeps showing it; prefer loopback or 0.0.0.0 behind
+# a firewall you control.
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: iac-es
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - cluster.name=iac-stack
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "{{ es_bind_address | default('127.0.0.1') }}:9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: iac-kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      # Placeholder, not a secret here: xpack.security is disabled, and the key
+      # only encrypts saved objects of features this setup does not use (the
+      # alert chain is code, monitor-check.py, deliberately not Kibana rules).
+      # Replace it before using any Kibana feature that stores credentials.
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=not-secure-dev-only-change-me-aaaa
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.0
+    container_name: iac-filebeat
+    user: root
+    restart: unless-stopped
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # THE entry point into logs-*. es_log_dir in group_vars/all must resolve
+      # to the host side of this mount, or result logs are written somewhere
+      # nobody reads, silently, with the play still green.
+      - ./logs:/logs:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+volumes:
+  es-data:
+    driver: local

@@ -1,0 +1,74 @@
+---
+# Compose up. Identical for every acquisition pattern: pattern-specific work
+# (pull / clone / rsync) already happened in the acquisition step. --build is
+# safe even for pure-image services — Compose only rebuilds services that
+# declare their own `build:` context, everyone else is a no-op.
+#
+# `changed` is decided by comparing the running container IDs before and after,
+# NOT by grepping the output. A condition like
+# `stdout is search('Recreated|Started|Created')` is structurally always false,
+# because docker compose writes its progress to STDERR, so the recap would say
+# `ok` for a stack that was in fact recreated.
+#
+# IDs instead of marker words on purpose: a changed container ID *is* the
+# definition of "recreated", while a marker word only describes it, and the
+# wording has moved between Compose versions. The comparison also covers the
+# neighbouring cases: a stack that did not exist yet (empty before), a stopped
+# container that gets started, and one that `--remove-orphans` takes away.
+- name: List the running containers before the up
+  ansible.builtin.command:
+    cmd: docker compose -p {{ sd_project }} -f "{{ service_compose_file }}" ps -q
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_ps_before
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Bring the compose project up
+  # `--force-recreate` only with `-e sd_force_recreate=true` (just deploy-force
+  # <svc>). `up -d` compares the desired config against the running container
+  # and does nothing when they match: correct for a deploy, useless when the
+  # thing that changed is a DAEMON default. Docker's log-rotation setting is the
+  # classic case: LogConfig is fixed when a container is created, so existing
+  # containers keep unbounded logs until each is recreated, and no compose file
+  # changed to make that happen.
+  ansible.builtin.command:
+    cmd: >-
+      docker compose -p {{ sd_project }} -f "{{ service_compose_file }}"
+      up -d --remove-orphans --build
+      {{ '--force-recreate' if sd_force_recreate | bool else '' }}
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_compose_up
+  # Deliberately never `changed` on its own: the honest answer needs the
+  # after-state, and this task's own output cannot give it.
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: List the running containers after the up
+  ansible.builtin.command:
+    cmd: docker compose -p {{ sd_project }} -f "{{ service_compose_file }}" ps -q
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_ps_after
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Report whether the stack actually moved
+  ansible.builtin.debug:
+    msg: >-
+      {{ sd_project }}: {{ sd_ids_before | length }} container(s) running before,
+      {{ sd_ids_after | length }} after —
+      {{ ('changed: ' ~ (sd_ids_after | difference(sd_ids_before) | length)
+          ~ ' new, ' ~ (sd_ids_before | difference(sd_ids_after) | length) ~ ' gone')
+         if sd_ids_before != sd_ids_after else 'no change' }}
+  vars:
+    sd_ids_before: "{{ sd_ps_before.stdout_lines | default([]) | sort }}"
+    sd_ids_after: "{{ sd_ps_after.stdout_lines | default([]) | sort }}"
+  changed_when: sd_ids_before != sd_ids_after
+  when: not ansible_check_mode
+
+- name: Report what would happen (check mode)
+  ansible.builtin.debug:
+    msg: >-
+      --check: would run `docker compose -p {{ sd_project }}
+      -f "{{ service_compose_file }}" up -d --remove-orphans --build`
+      in {{ sd_remote_dir }}
+  when: ansible_check_mode

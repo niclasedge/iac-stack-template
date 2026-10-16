@@ -1,0 +1,95 @@
+---
+# Rollback: best-effort. Restores the pre-deploy snapshot taken in
+# snapshot.yml and brings the previous config back up.
+#
+# ── The order is the point ───────────────────────────────────────────────────
+# A rollback that starts with `docker compose down` turns a failed deploy into
+# an outage: the stack is stopped before anyone knows whether the restore and
+# the following `up -d` will work. A rollback must never leave a service worse
+# off than the deploy found it, so there is no `down`:
+#
+#   - `up -d` after the restore already replaces containers whose config
+#     changed, which is exactly what the failed deploy did to them.
+#   - `--remove-orphans` already removes containers the failed deploy started
+#     that the restored config does not know.
+#   - and if the `up` fails, the OLD containers are usually still running,
+#     because nothing stopped them. That is the whole difference between a bad
+#     deploy and an outage.
+#
+# No snapshot means there is nothing to restore (a first deploy into an empty
+# directory). Stopping anything then is not a rollback, it is a second failure,
+# so this file does nothing at all in that case.
+- name: Check for a pre-deploy snapshot
+  ansible.builtin.stat:
+    path: "{{ sd_remote_dir }}.rollback"
+  register: sd_snapshot
+
+- name: Roll back through git (git-pull records a commit, not files)
+  # Git is its own snapshot, and a more accurate one: it restores exactly the
+  # tracked files the deploy reset, and leaves runtime state alone.
+  ansible.builtin.command:
+    cmd: git -c safe.directory={{ sd_remote_dir }} reset --hard {{ sd_pre_deploy_commit.stdout | trim }}
+    chdir: "{{ sd_remote_dir }}"
+  become: true
+  register: sd_rollback_git
+  failed_when: false
+  changed_when: (sd_rollback_git.rc | default(1)) == 0
+  when:
+    - service_deploy == 'git-pull'
+    - sd_pre_deploy_commit is defined
+    - (sd_pre_deploy_commit.stdout | default('') | trim) | length > 0
+
+- name: Restore the pre-deploy snapshot
+  # NO `--delete`. The snapshot deliberately holds only the paths the deploy
+  # can overwrite, so deleting everything not in it would wipe exactly the
+  # runtime state it was shrunk to protect. A file the deploy added survives
+  # the rollback, which is a far smaller price than deleting a database.
+  #
+  # `become: true` for the same reason as in snapshot.yml: the copy preserves
+  # the containers' own uids, and writing those back needs root.
+  ansible.builtin.command:
+    cmd: rsync -a "{{ sd_remote_dir }}.rollback/" "{{ sd_remote_dir }}/"
+  become: true
+  when:
+    - service_deploy != 'git-pull'
+    - sd_snapshot.stat.exists
+  changed_when: true
+
+# `changed_when` is bound to the real rc, never a hardcoded `true`. A command
+# whose `chdir` does not exist is NOT skipped in check mode: the action plugin
+# errors out before the skip, `failed_when: false` swallows that, and a
+# hardcoded `changed_when: true` would then report `changed` for a command that
+# never ran. With `rc | default(1)` a task that never produced an rc counts as
+# not changed, which is the honest answer.
+- name: Bring the previous config back up
+  ansible.builtin.command:
+    cmd: docker compose -p {{ sd_project }} -f "{{ service_compose_file }}" up -d --remove-orphans
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_rollback_up
+  failed_when: false
+  changed_when: (sd_rollback_up.rc | default(1)) == 0
+  when: sd_snapshot.stat.exists or (service_deploy == 'git-pull' and sd_rollback_git is defined)
+
+# The message must describe what happened, not what was attempted. Four cases
+# a naive report gets wrong: under `--check` every command above is skipped
+# (the service is untouched); after a restored snapshot a failed `compose up -d`
+# must not be announced as recovery; and without a snapshot the file
+# deliberately stops nothing.
+- name: Summarize what the rollback actually did
+  ansible.builtin.set_fact:
+    sd_rollback_note: >-
+      {{ 'DRY RUN (--check): nothing was restored or restarted — the running service is untouched.'
+         if ansible_check_mode
+         else ('Reset the checkout to ' ~ (sd_pre_deploy_commit.stdout | default('?') | truncate(12, true, '')) ~ ' and restarted — git-pull rolls back through git, not a file copy.')
+         if (service_deploy == 'git-pull' and sd_rollback_git is defined and (sd_rollback_git.rc | default(1)) == 0)
+         else 'No pre-deploy snapshot existed (first deploy into an empty directory) — nothing to roll back to. Deliberately stopped nothing; whatever was running is still running.'
+         if not sd_snapshot.stat.exists
+         else ('Rolled back to the pre-deploy snapshot at ' ~ sd_remote_dir ~ '.rollback, previous config is up again.')
+         if (sd_rollback_up.rc | default(1)) == 0
+         else ('Restored the snapshot at ' ~ sd_remote_dir ~ '.rollback, but `compose up -d` FAILED (rc='
+               ~ (sd_rollback_up.rc | default('n/a')) ~ ') — check whether the service is running: '
+               ~ 'docker compose -p ' ~ sd_project ~ ' ps') }}
+
+- name: Fail loudly — the deploy did not succeed
+  ansible.builtin.fail:
+    msg: "Deploy of '{{ service_name }}' on {{ service_host }} failed. {{ sd_rollback_note }}"

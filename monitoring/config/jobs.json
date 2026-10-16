@@ -1,0 +1,24 @@
+{
+  "version": "1",
+  "description": "Job definitions for the example job playbooks. Run one with: just job <id>. The schedule is the cron expression to use if you wire the job into cron (or any scheduler).",
+  "jobs": [
+    {
+      "id": "daily_health_check",
+      "name": "Daily health check (connectivity, services, host config, cron)",
+      "playbook": "checks/run_all_checks.yml",
+      "schedule": "0 17 * * *",
+      "timeout": 900,
+      "enabled": true,
+      "tags": ["monitoring", "daily"]
+    },
+    {
+      "id": "http_check",
+      "name": "HTTP availability check",
+      "playbook": "jobs/http_check.yml",
+      "schedule": "0 * * * *",
+      "timeout": 300,
+      "enabled": true,
+      "tags": ["monitoring", "http"]
+    }
+  ]
+}

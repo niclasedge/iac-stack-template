@@ -1,0 +1,69 @@
+---
+- name: Check host configuration on all hosts
+  hosts: all
+  gather_facts: yes
+  # an unreachable host must not fail the whole run (ansible rc=4)
+  ignore_unreachable: true
+  tasks:
+    - name: Get disk usage
+      shell: df -h / | tail -1 | awk '{print $5}'
+      register: disk_usage
+      changed_when: false
+
+    - name: Set disk usage fact
+      set_fact:
+        disk_pct: "{{ (disk_usage.stdout | default('0%')) | regex_replace('%', '') | int }}"
+
+    - name: Get memory info (macOS)
+      shell: |
+        total=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.1f", $1/1073741824}')
+        echo "${total}GB total"
+      register: memory_info
+      changed_when: false
+      # default('') guards unreachable hosts where facts were never gathered
+      when: ansible_os_family | default('') == "Darwin"
+
+    - name: Get memory info (Linux)
+      shell: free -h | head -2 | tail -1 | awk '{print $2 " total, " $3 " used"}'
+      register: memory_info
+      changed_when: false
+      when: ansible_os_family | default('') != "Darwin"
+
+    - name: Get uptime
+      shell: uptime | sed 's/.*up /up /' | sed 's/,.*//'
+      register: uptime_info
+      changed_when: false
+
+    - name: Host config summary
+      debug:
+        msg: |
+          Host: {{ inventory_hostname }} ({{ host_prefix }})
+          OS: {{ ansible_distribution | default('unknown') }} {{ ansible_distribution_version | default('') }}
+          Disk: {{ disk_pct }}% {{ '(WARNING!)' if disk_pct | int > disk_threshold_percent | default(95) | int else '(OK)' }}
+          Memory: {{ memory_info.stdout | default('unknown') }}
+          Uptime: {{ uptime_info.stdout | default('unknown') }}
+
+- name: Report host config status
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Collect disk warnings
+      set_fact:
+        disk_alerts: []
+
+    - name: Gather disk warnings from all hosts
+      set_fact:
+        disk_alerts: "{{ disk_alerts + [item ~ ': ' ~ hostvars[item]['disk_pct'] ~ '%'] }}"
+      loop: "{{ groups['all'] }}"
+      when: hostvars[item]['disk_pct'] | default(0) | int > hostvars[item]['disk_threshold_percent'] | default(95) | int
+
+    - name: Write structured host config log
+      # Filebeat only reads es_log_dir on the log host, see group_vars/all
+      delegate_to: "{{ es_log_host }}"
+      copy:
+        dest: "{{ es_log_dir }}/host_config_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.log"
+        content: >
+          {"@timestamp":"{{ lookup('pipe', 'date -u +%FT%TZ') }}",
+          "service":"host-config-check","level":"{{ 'error' if disk_alerts | length > 0 else 'info' }}",
+          "event":"host_config","disk_alerts":{{ disk_alerts | to_json }},
+          "message":"{{ 'DISK WARNINGS: ' ~ disk_alerts | join(', ') if disk_alerts | length > 0 else 'All hosts OK' }}"}

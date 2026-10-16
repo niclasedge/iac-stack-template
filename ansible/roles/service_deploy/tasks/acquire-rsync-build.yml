@@ -1,0 +1,142 @@
+---
+# Acquisition pattern: rsync-build — the service's buildable source has no
+# registry image; it lives in services/<name>/ (sd_local_dir) and is rsynced to
+# the target. `docker compose up -d --build` in the compose-up step builds it
+# there. Nothing builds in this file, so the acquisition step stays the only
+# thing that differs per pattern.
+- name: Fail fast if the service has no directory in the repo
+  ansible.builtin.stat:
+    path: "{{ sd_local_dir }}"
+  register: sd_local_dir_stat
+  delegate_to: localhost
+  check_mode: false
+
+- name: Assert the service directory exists
+  ansible.builtin.assert:
+    that: sd_local_dir_stat.stat.exists and sd_local_dir_stat.stat.isdir
+    fail_msg: >-
+      '{{ service_name }}' has no directory at {{ sd_local_dir }} —
+      deploy: rsync-build rsyncs its source from there.
+
+- name: Determine the rsync destination spec
+  # ansible_connection local means the "target" is this very machine: no SSH
+  # hop needed, plain paths on both sides. Everything else goes over SSH with
+  # the inventory's user and host.
+  ansible.builtin.set_fact:
+    sd_rsync_dest: >-
+      {{ (sd_remote_dir + '/') if (ansible_connection | default('ssh')) == 'local'
+         else (ansible_user + '@' + ansible_host + ':' + sd_remote_dir + '/') }}
+
+# --- Why the remote shell is spelled out ------------------------------------
+# The rsync tasks below run `delegate_to: localhost` as a plain `command`, so
+# rsync spawns its OWN ssh. That ssh inherits nothing from Ansible: not the
+# `-i` built from ansible_ssh_private_key_file, and not ansible.cfg's
+# ssh_args. The transfer would then depend on the controller's ~/.ssh/config
+# happening to resolve user@host to the same key.
+#
+# Without this the typical failure on a controller with a full ssh-agent is
+# "Too many authentication failures": ssh offers every agent key first and
+# burns the server's MaxAuthTries before the right key gets a turn, while
+# Ansible's own ping succeeds. Hence both flags: `-i` alone would still lose
+# the race, IdentitiesOnly makes it deterministic.
+#
+# ansible_port is not threaded through; the example inventory never leaves 22.
+- name: Determine the rsync remote shell
+  ansible.builtin.set_fact:
+    sd_rsync_rsh: >-
+      ssh -o IdentitiesOnly=yes -i {{ ansible_ssh_private_key_file }}
+  when:
+    - (ansible_connection | default('ssh')) != 'local'
+    - ansible_ssh_private_key_file | default('') | length > 0
+
+- name: Build the rsync remote-shell argument
+  # A separate fact rather than an inline conditional in both argv lists: the
+  # two rsync invocations must not be able to drift apart on how they connect.
+  ansible.builtin.set_fact:
+    sd_rsync_rsh_args: "{{ ['-e', sd_rsync_rsh | trim] if sd_rsync_rsh is defined else [] }}"
+
+# `--delete` removes everything on the target that the source does not have,
+# and runtime state is exactly that: it exists only on the host (a database
+# file, an uploads directory). The service's own `.gitignore` is the answer,
+# not a second list in services.yml: what a repo declares as not-its-content IS
+# the runtime state, and a duplicate list drifts silently.
+#
+# Why the .gitignore is translated instead of handed to rsync:
+# `--filter=':- .gitignore'` protects NOTHING for `--delete`, because the
+# deletion is decided on the RECEIVER, and command-line rules are transmitted
+# to it, whereas a `dir-merge` file is read by the sender only and never sent.
+# Also, .gitignore syntax is not rsync filter syntax. So: read the file, emit
+# one `--exclude=` per pattern. The common forms mean the same in both
+# languages (a bare name, a trailing slash for directories, a leading slash for
+# "anchored", `*` and `**`). A `!` negation does not: in an rsync filter it
+# CLEARS the accumulated rules, the opposite of un-ignoring one path, so it is
+# refused rather than mistranslated.
+#
+# `--exclude=.git` without the slash as well as with it, because a submodule's
+# `.git` is a FILE and the directory pattern never matches it.
+- name: Read the service's .gitignore, if it has one
+  ansible.builtin.set_fact:
+    sd_gitignore_lines: >-
+      {{ (lookup('file', sd_local_dir ~ '/.gitignore', errors='ignore') | default('', true))
+         .splitlines() | map('trim') | reject('match', '^#') | reject('equalto', '') | list }}
+  delegate_to: localhost
+  check_mode: false
+
+- name: Refuse a `!` negation rather than mistranslate it
+  ansible.builtin.assert:
+    that: sd_gitignore_lines | select('match', '^!') | list | length == 0
+    fail_msg: >-
+      {{ service_name }}'s .gitignore uses `!` to un-ignore
+      {{ sd_gitignore_lines | select('match', '^!') | join(', ') }}. In an rsync
+      filter a leading `!` clears every rule collected so far, so translating it
+      would silently drop the protection for everything above it. Rewrite the
+      pattern without the negation, or exclude its parent directory instead.
+  delegate_to: localhost
+  check_mode: false
+
+- name: Build the rsync argument list
+  ansible.builtin.set_fact:
+    # `.env` never travels: it is rendered on the target.
+    sd_rsync_args: >-
+      {{ ['--delete', '--exclude=.git', '--exclude=.git/', '--exclude=.env']
+         + (sd_gitignore_lines | map('regex_replace', '^(.*)$', '--exclude=\1') | list) }}
+  delegate_to: localhost
+  check_mode: false
+
+- name: Report what the rsync would delete on the target
+  # A dry run that says nothing proves nothing: `-n` costs one round trip and
+  # turns `just deploy-check` into an actual answer for the question that
+  # matters here: what disappears? `argv` instead of `cmd`, so there is no
+  # shell quoting to get wrong.
+  ansible.builtin.command:
+    argv: "{{ ['rsync', '-ain'] + sd_rsync_rsh_args + sd_rsync_args + [sd_local_dir ~ '/', sd_rsync_dest] }}"
+  delegate_to: localhost
+  register: sd_rsync_preview
+  changed_when: false
+  # Load-bearing: `command` has no check-mode support, so Ansible skips it under
+  # --check regardless of the `when` below. Without this the preview variable
+  # stays undefined and every deploy-check prints "would delete 0 path(s)"
+  # without ever asking. Safe to force: `-n` makes rsync change nothing.
+  check_mode: false
+  when: ansible_check_mode
+
+- name: Show the deletions the dry run found
+  ansible.builtin.debug:
+    msg: >-
+      --check: rsync would delete {{ sd_rsync_deletions | length }} path(s) on
+      {{ service_host }}{{ ': ' ~ (sd_rsync_deletions | join(', '))
+         if sd_rsync_deletions | length > 0 else '' }}
+  vars:
+    sd_rsync_deletions: >-
+      {{ sd_rsync_preview.stdout_lines | default([])
+         | select('match', '^\*deleting') | map('regex_replace', '^\*deleting\s+', '')
+         | list }}
+  when: ansible_check_mode
+
+- name: Rsync the service source to the target
+  ansible.builtin.command:
+    argv: "{{ ['rsync', '-ai'] + sd_rsync_rsh_args + sd_rsync_args + [sd_local_dir ~ '/', sd_rsync_dest] }}"
+  delegate_to: localhost
+  register: sd_rsync
+  changed_when: sd_rsync.stdout | trim | length > 0
+  when: not ansible_check_mode

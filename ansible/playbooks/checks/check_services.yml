@@ -1,0 +1,67 @@
+---
+- name: Check services on all hosts
+  hosts: all
+  gather_facts: yes
+  # an unreachable host must not fail the whole run (ansible rc=4)
+  ignore_unreachable: true
+  # Same override deploy.yml applies, and for the same reason: a non-interactive
+  # SSH command on some hosts (macOS, notably) gets a minimal PATH that does not
+  # contain the docker binary. Without it every `docker` below is not-found and
+  # the check reports `Runtime: none, Running: 0` for a host with containers up,
+  # the one failure mode a service check must never have, because it reads as
+  # "everything is down" and is indistinguishable from the real thing. Hosts
+  # that need nothing get an empty dict and are untouched.
+  environment: "{{ deploy_environment | default({}) }}"
+  tasks:
+    - name: Check Docker is running
+      shell: docker info > /dev/null 2>&1 && echo "running" || echo "stopped"
+      register: docker_status
+      changed_when: false
+      failed_when: false
+
+    - name: Set container runtime fact
+      set_fact:
+        # docker_status has no stdout when the host was unreachable (ignored)
+        container_runtime: "{{ 'docker' if docker_status.stdout | default('') == 'running' else 'none' }}"
+
+    - name: Get all running containers
+      shell: docker ps --format '{{ '{{' }}.Names{{ '}}' }}' 2>/dev/null || true
+      register: running_containers_raw
+      changed_when: false
+      failed_when: false
+      when: container_runtime != 'none'
+
+    - name: Set running containers list
+      set_fact:
+        running_containers: "{{ running_containers_raw.stdout_lines | default([]) }}"
+
+    - name: Set expected containers from group vars
+      set_fact:
+        expected_containers: "{{ hostvars[inventory_hostname]['expected_containers'] | default([]) }}"
+
+    - name: Find missing containers
+      set_fact:
+        missing_containers: "{{ expected_containers | difference(running_containers) | default([]) }}"
+
+    - name: Service summary
+      debug:
+        msg: |
+          === {{ inventory_hostname }} ({{ host_prefix }}) ===
+          Runtime: {{ container_runtime }}
+          Running: {{ running_containers | length }} containers
+          Expected: {{ expected_containers | length }} containers
+          {% if missing_containers | length > 0 %}MISSING: {{ missing_containers | join(', ') }}{% endif %}
+
+    - name: Write structured service log
+      # Filebeat only reads es_log_dir on the log host, see group_vars/all
+      delegate_to: "{{ es_log_host }}"
+      copy:
+        dest: "{{ es_log_dir }}/services_{{ inventory_hostname | replace('.', '_') }}_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.log"
+        content: >
+          {"@timestamp":"{{ lookup('pipe', 'date -u +%FT%TZ') }}",
+          "service":"services-check","target_host":"{{ inventory_hostname }}",
+          "level":"{{ 'error' if missing_containers | length > 0 else 'info' }}",
+          "event":"service_check","container_runtime":"{{ container_runtime }}",
+          "running_count":{{ running_containers | length }},
+          "expected_count":{{ expected_containers | length }},
+          "message":"{{ inventory_hostname }}: {{ 'MISSING: ' ~ missing_containers | join(', ') if missing_containers | length > 0 else 'all services OK' }}"}

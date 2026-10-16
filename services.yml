@@ -1,0 +1,72 @@
+# Service inventory: which service runs on which host and how it is deployed.
+#
+# Schema: services.schema.json. Validate with `just validate`.
+# Deploy one entry with `just deploy <name>` (see README).
+#
+# Each active service has a directory services/<name>/ holding its compose
+# file (plus whatever the deploy pattern ships, see below).
+#
+# deploy patterns:
+#   compose-pull  copy the compose file (+ `sync:` paths) to the host, then
+#                 `docker compose pull && up -d`. For images from a registry.
+#   rsync-build   transfer the whole services/<name>/ tree, build on the host.
+#                 For services with a Dockerfile.
+#   git-pull      clone/pull `repo:` on the host. For services that live in
+#                 their own repository.
+#
+# domain/aliases resolution: a dot in the value means it is already a full
+# FQDN and domain_suffix is ignored; otherwise domain_suffix is appended.
+# The Traefik labels in each compose file must carry the same resolved name.
+
+defaults:
+  host: edge-vps
+  state: active
+  deploy: compose-pull
+  domain_suffix: example.com
+  compose_file: docker-compose.yml
+
+services:
+  # Reverse proxy and TLS termination for everything on edge-vps. Deploy it
+  # first: the other stacks join its `proxy` network. It publishes 80/443
+  # itself, which is the one exception the validator allows.
+  traefik:
+    # No `domain:`/`health:`: the dashboard is not routed. The deploy falls back
+    # to "every container of the project is running".
+    {}
+
+  # Smallest possible routed service: answers with request headers. Use it to
+  # prove DNS, TLS and routing before deploying anything real.
+  whoami:
+    domain: whoami
+    health: /
+
+  # Uptime monitoring dashboard. Keeps its state in a named volume.
+  uptime-kuma:
+    domain: status
+    health: /
+
+  # Feed reader with a PostgreSQL sidecar. Shows the secrets path: the .env on
+  # the host is rendered from secrets/app.env (SOPS), never from a file in git.
+  miniflux:
+    domain: rss
+    health: /healthcheck
+    env_from_secrets:
+      POSTGRES_PASSWORD: MINIFLUX_DB_PASSWORD
+      ADMIN_USERNAME: MINIFLUX_ADMIN_USERNAME
+      ADMIN_PASSWORD: MINIFLUX_ADMIN_PASSWORD
+
+  # A small app built from its own Dockerfile (rsync-build) on the home server.
+  # No domain: internal service, no Traefik route. The port is bound to
+  # loopback only, so nothing but the host itself can reach it.
+  example-app:
+    host: home-server
+    deploy: rsync-build
+
+  # Parked declaration of a service that lives in its own repository
+  # (git-pull). Inactive, so it is never deployed and needs no directory here.
+  # Flip `state: active` and point `repo:` at a real repository to use it.
+  example-git-service:
+    host: home-server
+    deploy: git-pull
+    state: inactive
+    repo: https://github.com/example-org/example-service.git

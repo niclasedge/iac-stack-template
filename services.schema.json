@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/niclasedge/iac-stack-template/services.schema.json",
+  "title": "iac-stack-template services.yml",
+  "description": "Structural schema for services.yml. Cross-field rules the schema cannot express (git-pull needs repo, domain collisions, health needs domain, dot-rule resolution) live in scripts/validate_services.py, not here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "services"
+  ],
+  "properties": {
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/host"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "deploy": {
+          "$ref": "#/$defs/deploy"
+        },
+        "domain_suffix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "compose_file": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/service"
+      }
+    }
+  },
+  "$defs": {
+    "host": {
+      "enum": [
+        "edge-vps",
+        "home-server",
+        "workstation"
+      ]
+    },
+    "state": {
+      "enum": [
+        "active",
+        "inactive"
+      ]
+    },
+    "deploy": {
+      "enum": [
+        "compose-pull",
+        "git-pull",
+        "rsync-build"
+      ]
+    },
+    "service": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/host"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "deploy": {
+          "$ref": "#/$defs/deploy"
+        },
+        "domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "domain_suffix": {
+          "type": "string",
+          "minLength": 1
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "health": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "URL path, must start with a leading slash"
+        },
+        "published_port_ok": {
+          "type": "string",
+          "minLength": 20,
+          "description": "Waives the 'no wildcard port next to a domain' rule for this one service. A string, not a boolean: the value is the reason, and the length floor is there so it has to be one. validate_services.py lists every waiver on each run so the exception stays visible instead of becoming the new normal."
+        },
+        "repo": {
+          "type": "string",
+          "minLength": 1
+        },
+        "compose_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "base_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Overrides service_base_dir (ansible group_vars) for this service."
+        },
+        "sync": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "compose-pull only: paths inside services/<name>/ that must reach the host next to the compose file, e.g. a sidecar config a volume mounts from ./. Relative to the service directory, no leading/trailing slash, no '..'. The compose file itself is implicit. A path that does NOT exist in the service directory is runtime state and does not belong here; see validate_services.py.",
+          "items": {
+            "type": "string",
+            "pattern": "^(?!/)(?!.*\\.\\.)(?!.*/$).+$"
+          }
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*\\.\\.)(?!.*/$).+$",
+          "description": "Directory relative to base_dir, replaces the service name segment. No leading/trailing slash, no '..'."
+        },
+        "env_rerender": {
+          "type": "boolean",
+          "description": "Re-render .env.j2 on EVERY deploy instead of only the first. Only for services whose .env is a pure projection of the controller's environment; a template that GENERATES secrets (lookup('password', ...)) would rotate them on every deploy and must keep the default."
+        },
+        "env_from_secrets": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^(secrets/app\\.env:)?[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "description": "Render the host .env from the encrypted secrets file instead of from .env.j2, which this takes precedence over. Maps the variable name the compose file or app expects to a reference '[<file>:]<KEY>'. Without a file prefix the key is looked up in secrets/app.env. The file list is an allowlist rather than a free path because the value ends up in REPO_ROOT / <file> inside lookup_plugins/sops_dotenv.py, and pathlib discards the left operand when the right one is absolute. The mapping is explicit on purpose: the compose variable name and the secret key may differ. Re-rendered on every deploy: the encrypted file is the source of truth, so there is nothing to preserve on the host."
+        }
+      }
+    }
+  }
+}

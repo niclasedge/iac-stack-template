@@ -1,0 +1,43 @@
+---
+service_base_dir: /home/deploy/apps
+
+# ── Firewall ─────────────────────────────────────────────────────────────────
+# The complete set of UFW rules for this group. runbooks/firewall.yml converges
+# against it: what is missing gets added, what is not listed here gets DELETED.
+# There is no second place to look, and a rule nobody declared here is a rule
+# nobody meant to keep.
+#
+# `spec` is the ufw command minus the leading `ufw`, spelled exactly as
+# `ufw show added` prints it back; that is what makes the comparison a string
+# match instead of a parser.
+#
+# What UFW does NOT govern: Docker writes its port publications into iptables
+# AHEAD of the UFW chains, so every service published through docker-proxy is
+# reachable no matter what stands below. Closing those means removing the
+# publication from the service's compose file, not adding a rule here;
+# `just validate` enforces that for services behind Traefik. The rules below
+# matter for processes that bind the host directly (sshd) or containers with
+# `network_mode: host`.
+ufw_rules:
+  - spec: allow 22/tcp
+    why: >-
+      SSH. sshd binds the host directly, so this rule is load-bearing, and it is
+      the one that locks everyone out if it disappears. The playbook refuses to
+      run without it.
+
+  - spec: allow 443/tcp
+    why: >-
+      Traefik HTTPS. Effectively a no-op while Traefik publishes 443 through
+      docker-proxy, kept as a statement of intent and as the rule that would
+      matter if Traefik ever ran outside docker. Port 80 deliberately has NO
+      rule for the same reason.
+
+  - spec: allow from 172.18.0.0/16 to any port 9100
+    comment: node-exporter from the proxy network
+    why: >-
+      Example of a host-networked service (`network_mode: host`), where UFW
+      really is the only thing in the way. Restricted to the docker proxy
+      network so the port is not open to the internet.
+
+  - spec: allow out 587/tcp
+    why: SMTP submission for outgoing mail. The only outbound rule.

@@ -1,0 +1,140 @@
+---
+# Deploy the Elastic stack (Elasticsearch, Kibana, Filebeat) on the log host.
+#
+#   just monitoring-stack [--check]
+#
+# Filebeat is the ONLY entry point into
+#   logs-* -> Elasticsearch -> monitor-check -> GitHub Issue.
+# A result log written to a directory no Filebeat watches is still written, the
+# play still reports success, and the document simply never arrives. So: bring
+# the stack up here FIRST, verify it ingests (the probe at the end does), and
+# only then point `es_log_host` in group_vars/all at this host.
+#
+# The stack runs without authentication; see the header of
+# templates/monitoring/docker-compose.yml.j2 before changing the bind address.
+- name: Elastic stack (Elasticsearch, Kibana, Filebeat)
+  hosts: homelab
+  gather_facts: true
+
+  vars:
+    stack_dir: "{{ ansible_env.HOME }}/monitoring"
+    repo_root: "{{ playbook_dir | dirname | dirname | dirname }}"
+    es_url: "http://127.0.0.1:9200"
+
+  tasks:
+    - name: Create the stack and ingest directories
+      # `logs/` is the host side of Filebeat's bind mount and must exist before
+      # the container starts: Docker would otherwise create it as root-owned,
+      # and the delegated `copy` tasks that write result logs into it would then
+      # fail with a permission error nobody expects on their own host.
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ stack_dir }}"
+        - "{{ stack_dir }}/logs"
+
+    - name: Ship the Filebeat configuration
+      # Copied rather than templated: a second copy that can drift is exactly
+      # how "why does this host index different fields" starts.
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/monitoring/filebeat.yml"
+        dest: "{{ stack_dir }}/filebeat.yml"
+        mode: "0644"
+      notify: Restart monitoring stack
+
+    - name: Render the compose file
+      ansible.builtin.template:
+        src: monitoring/docker-compose.yml.j2
+        dest: "{{ stack_dir }}/docker-compose.yml"
+        mode: "0644"
+      notify: Restart monitoring stack
+
+    - name: Bring the stack up
+      ansible.builtin.command:
+        cmd: docker compose -p monitoring -f {{ stack_dir }}/docker-compose.yml up -d
+        chdir: "{{ stack_dir }}"
+      register: compose_up
+      changed_when: "'Started' in compose_up.stderr or 'Created' in compose_up.stderr"
+
+    - name: Wait for Elasticsearch to report a usable cluster
+      # `status` rather than a plain 200: a single-node cluster with unassigned
+      # replicas answers 200 while being red. green or yellow both mean "will
+      # accept writes"; yellow is the normal steady state here, because
+      # single-node cannot place replicas.
+      ansible.builtin.uri:
+        url: "{{ es_url }}/_cluster/health"
+        return_content: true
+      register: es_health
+      retries: 30
+      delay: 5
+      until: es_health.status == 200 and es_health.json.status in ['green', 'yellow']
+      changed_when: false
+
+    - name: Apply the logs-* index template
+      # filebeat.yml sets `setup.template.enabled: false`, so nothing else
+      # creates this. Without it Elasticsearch maps dynamically and level,
+      # service, event and status become `text`: monitor-check.py queries
+      # `level.keyword: error`, which then matches nothing at all. That failure
+      # is the worst shape available: the chain reports "all clear" while the
+      # index is unusable.
+      #
+      # PUT is a full replace and therefore idempotent.
+      ansible.builtin.uri:
+        url: "{{ es_url }}/_index_template/logs-template"
+        method: PUT
+        body_format: json
+        body: "{{ lookup('file', repo_root ~ '/monitoring/config/logs-index-template.json') | from_json }}"
+        status_code: [200, 201]
+      register: template_put
+      changed_when: template_put.status in [200, 201]
+
+    - name: Prove that Filebeat actually ingests from this host
+      # The one check that matters, and the one that is easy to skip: a running
+      # Filebeat proves nothing about whether ITS logs directory is the one the
+      # playbooks write to. Writing a marker and reading it back out of
+      # Elasticsearch tests the whole path: file -> Filebeat -> index.
+      #
+      # `>` and NOT `>-`, and that single character is the whole lesson here.
+      # filestream reads line by line and treats a trailing newline as the end
+      # of a line; without one the last line is never complete, so Filebeat
+      # opens the file, keeps the reader on it, and sends nothing, with no error
+      # anywhere. `>-` (folded, strip) removes that newline; `>` (folded, clip)
+      # keeps it, which is why every job playbook uses `>`.
+      #
+      # ansible_date_time.iso8601 is already UTC with a Z, and it matches the
+      # `2006-01-02T15:04:05Z` layout filebeat.yml lists. Formatting the time
+      # with strftime instead renders LOCAL time under a Z suffix, which puts
+      # the document hours into the future: invisible in a "last 15 minutes"
+      # dashboard query.
+      ansible.builtin.copy:
+        dest: "{{ stack_dir }}/logs/result_ingest_probe_{{ inventory_hostname }}.log"
+        mode: "0644"
+        content: >
+          {"@timestamp":"{{ ansible_date_time.iso8601 }}","service":"iac-stack","level":"info","event":"ingest_probe","target_host":"{{ inventory_hostname }}","message":"monitoring_stack.yml verifying the Filebeat path"}
+
+    - name: Read the marker back out of Elasticsearch
+      ansible.builtin.uri:
+        url: "{{ es_url }}/logs-*/_search?q=event:ingest_probe&size=1"
+        return_content: true
+      register: probe_search
+      retries: 30
+      delay: 5
+      until: probe_search.status == 200 and (probe_search.json.hits.total.value | default(0)) > 0
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          Elasticsearch {{ es_health.json.status }} on {{ inventory_hostname }},
+          and Filebeat ingested the probe from {{ stack_dir }}/logs: the path
+          into logs-* works. Next: set es_log_host in group_vars/all to this
+          host if it is not already.
+
+  handlers:
+    - name: Restart monitoring stack
+      ansible.builtin.command:
+        cmd: docker compose -p monitoring -f {{ stack_dir }}/docker-compose.yml restart
+        chdir: "{{ stack_dir }}"
+      changed_when: true

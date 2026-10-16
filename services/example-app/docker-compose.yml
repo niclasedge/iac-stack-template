@@ -1,0 +1,11 @@
+# Example app built from the Dockerfile next to this file (rsync-build: the
+# whole directory is transferred and built on the host). The port is bound to
+# loopback: reachable from the host itself, not from the network.
+
+services:
+  example-app:
+    build: .
+    image: example-app:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"

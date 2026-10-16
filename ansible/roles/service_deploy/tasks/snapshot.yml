@@ -1,0 +1,129 @@
+---
+# Prep for the rollback: back up what the acquisition is about to overwrite, so
+# a failed deploy has something to roll back to. A first-ever deploy finds
+# nothing yet, which is fine (see rollback.yml).
+#
+# ── Snapshot only what the deploy can overwrite ──────────────────────────────
+# Copying the WHOLE target directory would include everything the service has
+# written into it since (databases, media, node_modules): gigabytes of
+# `.rollback` directories that no deploy touches. So the snapshot follows the
+# acquisition pattern:
+#
+#   compose-pull  the compose file and the `sync:` paths — that IS everything
+#                 this pattern writes.
+#   rsync-build   the whole tree, because that is what the rsync replaces.
+#                 The service's .gitignore already keeps runtime state out of
+#                 the deploy, and the same paths keep the tree small.
+#   git-pull      nothing. Git is its own snapshot: the current commit is
+#                 recorded below and rollback.yml resets to it, which is both
+#                 smaller and more accurate than a file copy.
+- name: Check whether the service directory already has content
+  ansible.builtin.command:
+    cmd: sh -c 'ls -A "{{ sd_remote_dir }}" 2>/dev/null | head -1'
+  register: sd_existing
+  changed_when: false
+  check_mode: false
+
+- name: Record the current commit (git-pull rolls back through git, not files)
+  ansible.builtin.command:
+    cmd: git -c safe.directory={{ sd_remote_dir }} rev-parse HEAD
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_pre_deploy_commit
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - service_deploy == 'git-pull'
+    - sd_existing.stdout | trim | length > 0
+
+- name: Decide which paths this deploy can overwrite
+  ansible.builtin.set_fact:
+    # An empty list means "no file snapshot": git-pull, and any pattern that
+    # writes nothing.
+    sd_snapshot_paths: >-
+      {{ ([service_compose_file] + (service_sync | default([])))
+         if service_deploy == 'compose-pull'
+         else (['.'] if service_deploy == 'rsync-build' else []) }}
+
+- name: Keep only snapshot paths that already exist on the host
+  # A sync path that is new (the first deploy of a file added to sync:) has
+  # nothing to snapshot, and a BSD rsync without --delete-missing-args dies
+  # with rc 23 on a missing source argument. Nothing is lost by narrowing: a
+  # file that does not exist yet cannot hold state.
+  ansible.builtin.command:
+    cmd: sh -c 'for p in {{ sd_snapshot_paths | join(" ") }}; do [ -e "$p" ] && printf "%s\n" "$p"; done; exit 0'
+    chdir: "{{ sd_remote_dir }}"
+  register: sd_existing_snapshot_paths
+  changed_when: false
+  check_mode: false
+  when:
+    - sd_snapshot_paths | length > 0
+    - sd_existing.stdout | trim | length > 0
+    - not ansible_check_mode
+
+- name: Narrow the snapshot list to what exists (skipped in check mode)
+  ansible.builtin.set_fact:
+    sd_snapshot_paths: "{{ sd_existing_snapshot_paths.stdout_lines | default([]) }}"
+  when:
+    - sd_snapshot_paths | length > 0
+
+# Without this, a new narrow snapshot would be written INTO an older, wider one,
+# and rollback.yml restores without `--delete`: stale data from the old
+# snapshot would be copied back over the live files. Clearing first also
+# retires leftover `.rollback` directories from earlier runs.
+- name: Clear the previous snapshot so old and new cannot mix
+  # Unconditional on purpose, including git-pull, where no file snapshot is
+  # written at all: whatever is in there predates this run and is superseded by
+  # it, either by the snapshot written below or by the commit recorded above.
+  ansible.builtin.file:
+    path: "{{ sd_remote_dir }}.rollback"
+    state: absent
+  become: true
+  when: not ansible_check_mode
+
+# macOS ships Apple's openrsync ("rsync version 2.6.9 compatible"), which does
+# not know `--delete-missing-args`. Probing the binary beats deriving the
+# decision from the OS: this play runs with `gather_facts: false`, so
+# `ansible_system` is not available, and a Mac with GNU rsync from Homebrew
+# should keep the flag.
+- name: Check whether the target's rsync knows --delete-missing-args
+  ansible.builtin.shell:
+    cmd: rsync --help 2>&1 | grep -q -- '--delete-missing-args'
+  register: sd_rsync_dma
+  changed_when: false
+  failed_when: false
+  when:
+    - sd_snapshot_paths | length > 0
+    - sd_existing.stdout | trim | length > 0
+    - not ansible_check_mode
+
+# `become: true` is load-bearing: the deploy user usually cannot read what the
+# containers write (a database data directory owned by the container's uid).
+# Without root the rsync exits 23, and an rsync that dies part-way leaves an
+# INCOMPLETE snapshot. Root reads everything, and `-a` preserves the original
+# ownership, so the copy is faithful. `--relative` keeps nested paths at their
+# place inside the snapshot instead of flattening them.
+- name: Snapshot the paths this deploy can overwrite
+  ansible.builtin.command:
+    argv: >-
+      {{ ['rsync', '-a', '--relative']
+         + (['--delete-missing-args'] if (sd_rsync_dma.rc | default(1)) == 0 else [])
+         + sd_snapshot_paths
+         + [sd_remote_dir ~ '.rollback/'] }}
+    chdir: "{{ sd_remote_dir }}"
+  become: true
+  when:
+    - sd_snapshot_paths | length > 0
+    - sd_existing.stdout | trim | length > 0
+    - not ansible_check_mode
+  changed_when: true
+
+- name: Report what was preserved
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('rollback point: commit ' ~ (sd_pre_deploy_commit.stdout | default('unknown') | truncate(12, true, ''))
+          ~ ' (git-pull resets to it, no file copy)')
+         if service_deploy == 'git-pull'
+         else ('snapshot: ' ~ (sd_snapshot_paths | join(', ')) ~ ' → ' ~ sd_remote_dir ~ '.rollback')
+         if sd_snapshot_paths | length > 0
+         else 'nothing to snapshot' }}

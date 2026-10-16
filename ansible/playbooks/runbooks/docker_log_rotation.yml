@@ -1,0 +1,298 @@
+---
+# Docker without log rotation: with no /etc/docker/daemon.json the json-file
+# driver grows unbounded, and one chatty container can fill the root disk.
+# Logs of RUNNING containers are in no `docker system prune` category, so a
+# cleanup job reports success while / fills up.
+#
+# ── The part that is easy to get wrong ──────────────────────────────────────
+# Three separate things have to happen, and only the first is permanent:
+#
+#   1. daemon.json sets the default for containers CREATED FROM NOW ON.
+#   2. The daemon only reads that file at START. `log-driver`/`log-opts` are NOT
+#      in dockerd's SIGHUP-reloadable set (that list is debug, labels,
+#      live-restore, insecure-registries, dns, runtimes, …), so a reload is not
+#      enough — it takes `systemctl restart docker`.
+#   3. A daemon restart does NOT give existing containers rotation. LogConfig is
+#      fixed when a container is CREATED; restarting the daemon stops and starts
+#      the same container objects, log settings and all. Existing containers get
+#      rotation when they are RECREATED — i.e. on their next `just deploy`, or a
+#      `docker compose up -d --force-recreate`.
+#
+# So this playbook does not pretend to be a one-shot fix. It writes the default,
+# empties the files that already grew, and then REPORTS how many running
+# containers are still unbounded — the number that only goes to zero as services
+# get redeployed. That report is the point: without it the tempting conclusion
+# after a green run is "handled", and the disk would keep filling.
+#
+# Truncating is safe on a running container: docker holds the file open, and
+# `truncate -s 0` keeps the inode. `rm` would not — the container would keep
+# writing to an unlinked file and the space would never come back.
+#
+#   just docker-log-rotation-check     # dry run
+#   just docker-log-rotation           # apply
+#
+# The daemon restart is opt-in and off by default, because it stops every
+# container on the host for the duration:
+#
+#     -e restart_docker=true
+- name: Cap Docker container logs
+  hosts: vps
+  gather_facts: false
+  become: true
+
+  vars:
+    # 10m x 3 files caps each container at 30 MB; multiply by the number of
+    # containers for the worst case on the host.
+    docker_log_max_size: 10m
+    docker_log_max_file: "3"
+    # Only files above this leave anything worth keeping behind. A fresh log of a
+    # few hundred KB is diagnostically useful and reclaims nothing.
+    truncate_above_mb: 10
+    # See the header: nothing in daemon.json takes effect until the daemon
+    # restarts, and that stops every container. Opt in deliberately.
+    restart_docker: false
+
+    # Create a container, ask what log settings it inherited, throw it away. The
+    # only way to answer "is the default in effect?" without touching a service;
+    # `docker info` does not print log-opts. Evaluated where it is used, so the
+    # two probe tasks stay one definition.
+    dlr_probe_cmd: |
+      set -o pipefail
+      docker rm -f iac-logconfig-probe >/dev/null 2>&1 || true
+      img=$(docker images -q | head -1)
+      test -n "$img" || { echo "no local image to probe with"; exit 0; }
+      docker create --name iac-logconfig-probe "$img" true >/dev/null
+      docker inspect iac-logconfig-probe |
+        python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["HostConfig"]["LogConfig"]))'
+      docker rm -f iac-logconfig-probe >/dev/null
+    # The measured answer, used to decide whether a restart is needed at all.
+    dlr_rotation_active: "{{ 'max-size' in (dlr_probe_before.stdout | default('')) }}"
+
+  tasks:
+    - name: Confirm docker answers before touching its configuration
+      ansible.builtin.command: docker info
+      register: dlr_docker
+      changed_when: false
+      failed_when: dlr_docker.rc != 0
+      check_mode: false
+
+    - name: Measure the container logs before
+      # `find -printf` instead of du: du reports disk blocks, and the question
+      # here is bytes per log file. `+0` guards against no matches at all.
+      ansible.builtin.shell: |
+        set -o pipefail
+        find /var/lib/docker/containers -name '*-json.log' -printf '%s\n' 2>/dev/null |
+          awk '{t+=$1; n++} END {printf "%d %d\n", t+0, n+0}'
+      args:
+        executable: /bin/bash
+      register: dlr_before
+      changed_when: false
+      check_mode: false
+
+    - name: Show what is there now
+      ansible.builtin.debug:
+        msg: >-
+          {{ (dlr_before.stdout.split()[0] | int / 1048576) | round(1) }} MB in
+          {{ dlr_before.stdout.split()[1] }} log file(s);
+          {{ (dlr_before.stdout.split()[0] | int / 1048576) | round(1) }} MB is what
+          rotation and truncation together can reclaim.
+
+    # ── 1. The permanent part ────────────────────────────────────────────────
+    - name: Write /etc/docker/daemon.json
+      # `validate` is load-bearing, not hygiene: dockerd refuses to start on a
+      # malformed daemon.json, and the failure would surface at the next reboot
+      # with every container down. json.tool checks the file BEFORE it is moved
+      # into place, so a broken template can never reach /etc/docker.
+      ansible.builtin.copy:
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "{{ docker_log_max_size }}",
+              "max-file": "{{ docker_log_max_file }}"
+            }
+          }
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        validate: python3 -m json.tool %s
+      register: dlr_daemon_json
+
+    # ── 2. Is the default in effect? Measure, do not assume ──────────────────
+    - name: Ask docker what a NEW container would get
+      # A created-but-never-started container inherits the daemon defaults, which
+      # is exactly the question — and it answers it without recreating anything
+      # that serves traffic. `docker images -q` picks a local image so this needs
+      # no registry, and no `--format` so no Go template collides with Jinja.
+      ansible.builtin.shell: "{{ dlr_probe_cmd }}"
+      args:
+        executable: /bin/bash
+      register: dlr_probe_before
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Report what a new container inherits right now
+      ansible.builtin.debug:
+        msg: >-
+          A container created right now would get:
+          {{ dlr_probe_before.stdout | default('(not probed)') }} —
+          {{ 'rotation ACTIVE' if dlr_rotation_active else 'still UNBOUNDED' }}
+      when: not ansible_check_mode
+
+    - name: Restart docker so the daemon picks the new defaults up
+      # Only with -e restart_docker=true. Containers with `restart: unless-stopped`
+      # come back by themselves; the outage is the daemon's start-up time.
+      #
+      # The condition is the MEASURED state, not `dlr_daemon_json.changed`. That
+      # was the first version and it was wrong in exactly the case this runbook
+      # exists for: write daemon.json in one run, come back later with
+      # `-e restart_docker=true`, and the file is unchanged — so the restart
+      # skipped and the run reported "not active yet" while doing nothing about
+      # it. A `changed` flag is a statement about this run's action, never about
+      # the state of the system.
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+      when:
+        - restart_docker | bool
+        - not ansible_check_mode
+        - not dlr_rotation_active
+      register: dlr_restart
+
+    - name: Verify the restart actually took effect
+      ansible.builtin.shell: "{{ dlr_probe_cmd }}"
+      args:
+        executable: /bin/bash
+      register: dlr_probe_after
+      changed_when: false
+      when: dlr_restart is defined and dlr_restart.changed | default(false)
+
+    - name: Assert a new container now inherits the limit
+      # Without this the restart is just an action; here it becomes a result.
+      ansible.builtin.assert:
+        that: "'max-size' in dlr_probe_after.stdout"
+        fail_msg: >-
+          docker was restarted but a new container still gets
+          {{ dlr_probe_after.stdout }} — daemon.json is not being read. Check
+          `journalctl -u docker | tail` and /etc/docker/daemon.json.
+        success_msg: >-
+          rotation is now the default for new containers:
+          {{ dlr_probe_after.stdout }}
+      when: dlr_probe_after is defined and dlr_probe_after.stdout is defined
+
+    - name: Say plainly that the new default is not active yet
+      ansible.builtin.debug:
+        msg: >-
+          daemon.json is written but NOT in effect — dockerd only reads it at
+          start, and `log-opts` is not SIGHUP-reloadable. Rerun with
+          `-e restart_docker=true` inside a maintenance window; until then every
+          container created keeps growing without a limit.
+      when:
+        - not ansible_check_mode
+        - not dlr_rotation_active
+        - not (restart_docker | bool)
+
+    # ── 3. Reclaim what already grew ─────────────────────────────────────────
+    - name: Report which files would be emptied (check mode)
+      ansible.builtin.shell: |
+        set -o pipefail
+        find /var/lib/docker/containers -name '*-json.log' -size +{{ truncate_above_mb }}M \
+          -printf '%s %p\n' 2>/dev/null | sort -rn |
+          awk '{printf "%.1f MB  %s\n", $1/1048576, $2}'
+      args:
+        executable: /bin/bash
+      register: dlr_candidates
+      changed_when: false
+      check_mode: false
+
+    - name: Show the candidates
+      ansible.builtin.debug:
+        msg: "{{ dlr_candidates.stdout_lines | default(['(nothing above ' ~ truncate_above_mb ~ ' MB)']) }}"
+
+    - name: Empty the oversized logs
+      # Not `rm`: the container holds the file open, so unlinking it would leave
+      # the space allocated to a file nobody can see until the container stops.
+      ansible.builtin.command:
+        argv:
+          - find
+          - /var/lib/docker/containers
+          - -name
+          - "*-json.log"
+          - -size
+          - "+{{ truncate_above_mb }}M"
+          - -exec
+          - truncate
+          - -s
+          - "0"
+          - "{}"
+          - +
+      register: dlr_truncate
+      changed_when: dlr_candidates.stdout | trim | length > 0
+      when: not ansible_check_mode
+
+    # ── 4. What is still open ────────────────────────────────────────────────
+    - name: Count running containers that still have no log limit
+      # The honest answer to "are we done?". These keep growing until each is
+      # recreated — daemon.json cannot reach a container that already exists.
+      ansible.builtin.shell: |
+        set -o pipefail
+        ids=$(docker ps -q)
+        test -n "$ids" || { echo "0 0"; exit 0; }
+        docker inspect $ids | python3 -c '
+        import json, sys
+        cs = json.load(sys.stdin)
+        unbounded = [c["Name"].lstrip("/") for c in cs
+                     if not c["HostConfig"]["LogConfig"].get("Config", {}).get("max-size")]
+        print(len(unbounded), len(cs))
+        print(" ".join(sorted(unbounded)))'
+      args:
+        executable: /bin/bash
+      register: dlr_unbounded
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Measure the container logs after
+      ansible.builtin.shell: |
+        set -o pipefail
+        find /var/lib/docker/containers -name '*-json.log' -printf '%s\n' 2>/dev/null |
+          awk '{t+=$1} END {printf "%d\n", t+0}'
+      args:
+        executable: /bin/bash
+      register: dlr_after
+      changed_when: false
+      check_mode: false
+
+    - name: Disk after
+      ansible.builtin.command: df -h /
+      register: dlr_df
+      changed_when: false
+      check_mode: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: |
+          -- Docker log rotation ------------------------------------
+          logs      {{ (dlr_before.stdout.split()[0] | int / 1048576) | round(1) }} MB
+                 ->  {{ (dlr_after.stdout | int / 1048576) | round(1) }} MB
+          {# A dry run that says "written" would be a lie: --check changes nothing. #}
+          daemon.json  {{ ('would be written' if ansible_check_mode else 'written')
+                          if dlr_daemon_json.changed else 'unchanged' }},
+                       default {{ docker_log_max_size }} x {{ docker_log_max_file }}
+          restarted    {{ 'yes' if (dlr_restart is defined and dlr_restart.changed | default(false)) else 'no' }}
+          {# Two different statements, and conflating them was the first version's
+             bug: whether THIS run restarted docker, and whether the default is in
+             effect at all. It can be active because an earlier run restarted. #}
+          {% if not ansible_check_mode %}
+          new containers {{ 'inherit the limit' if (('max-size' in (dlr_probe_after.stdout | default('')))
+                                                    or dlr_rotation_active | bool)
+                            else 'are still UNBOUNDED - rerun with -e restart_docker=true' }}
+          still unbounded: {{ (dlr_unbounded.stdout_lines[0] | default('? ?')).split()[0] }} of
+                           {{ (dlr_unbounded.stdout_lines[0] | default('? ?')).split()[1] }} running containers
+                           {{ dlr_unbounded.stdout_lines[1] | default('') }}
+          These keep growing until each is recreated (`just deploy <service>`);
+          a daemon restart alone does not change an existing container's LogConfig.
+          {% endif %}
+          {{ dlr_df.stdout_lines | last }}
+          ------------------------------------------------------------

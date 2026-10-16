@@ -1,0 +1,111 @@
+---
+# Scheduled HTTP availability check, the reference shape for a job playbook:
+#
+#   1. ping the dead man's switch (start)
+#   2. run the payload under `register` + `ignore_errors`
+#   3. write ONE structured result log line to the log host (Filebeat -> ES ->
+#      monitor-check -> GitHub Issue)
+#   4. ping success/fail
+#   5. end with a `fail:` task guarded on the payload's rc
+#
+# Step 5 is not decoration. `ignore_errors` is what lets steps 3 and 4 run after
+# a crash, and it also leaves the recap at failed=0, so a crashed payload would
+# report success. tests/test_job_playbooks_fail_loudly.py enforces the guard.
+#
+# Findings (a URL is down) are NOT job failures: the script exits 0 and the
+# finding travels through the level:error result log.
+#
+#   just job http_check
+#   just job http_check -e hc_uuid=<uuid>
+- name: HTTP check
+  hosts: localhost
+  gather_facts: false
+  vars:
+    job_name: http_check
+    hc_uuid: ""
+    # The URLs to probe. Replace with the health URLs of your services (the
+    # domain + health path from services.yml).
+    http_check_urls:
+      - https://whoami.example.com/
+      - https://status.example.com/
+
+  pre_tasks:
+    - name: Ping healthcheck start
+      ansible.builtin.uri:
+        url: "{{ healthchecks_url }}/ping/{{ hc_uuid }}/start"
+        method: GET
+        timeout: 10
+      run_once: true
+      ignore_errors: true
+      when: hc_uuid | length > 0
+
+  tasks:
+    - name: Run the HTTP check
+      ansible.builtin.script: ../../scripts/jobs/http_check.py
+      args:
+        executable: python3
+      environment:
+        HTTP_CHECK_URLS: "{{ http_check_urls | join(',') }}"
+      register: result
+      ignore_errors: true
+
+    - name: Parse the check result
+      ansible.builtin.set_fact:
+        check_data: "{{ (result.stdout | trim | from_json) if (result.stdout | default('') | trim)[0:1] == '{' else {} }}"
+      failed_when: false
+
+    - name: Build the result message
+      ansible.builtin.set_fact:
+        check_message: >-
+          {{ (check_data.up | string ~ '/' ~ check_data.total | string ~ ' URLs up')
+             if check_data.total is defined
+             else ('parse error: ' ~ ((result.stdout | default('', true) | trim) or (result.stderr | default('', true) | trim) or 'no output') | truncate(200)) }}
+      failed_when: false
+
+    - name: Write structured result log
+      # Filebeat only reads es_log_dir on the log host, see group_vars/all.
+      # `content: >` (folded, clip) keeps the trailing newline filestream needs
+      # and renders ONE line; see tests/test_result_log_is_one_line.py.
+      delegate_to: "{{ es_log_host }}"
+      ansible.builtin.copy:
+        dest: "{{ es_log_dir }}/result_http_check_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.log"
+        content: >
+          {"@timestamp":"{{ lookup('pipe', 'date -u +%FT%TZ') }}",
+          "service":"http_check","target_host":"{{ inventory_hostname }}",
+          "level":"{{ 'error' if (check_data.total is not defined) or (check_data.down | default(1) | int > 0) else 'info' }}",
+          "event":"result",
+          "urls_up":{{ check_data.up | default(0) }},"urls_total":{{ check_data.total | default(0) }},
+          "down_urls":{{ (check_data.down_urls | default([]) | map(attribute='url') | list) | to_json }},
+          "message":{{ check_message | to_json }}}
+      failed_when: false
+
+  post_tasks:
+    - name: Ping healthcheck success
+      ansible.builtin.uri:
+        url: "{{ healthchecks_url }}/ping/{{ hc_uuid }}"
+        method: GET
+        timeout: 10
+      run_once: true
+      when:
+        - hc_uuid | length > 0
+        - result.rc == 0
+      ignore_errors: true
+
+    - name: Ping healthcheck failure
+      ansible.builtin.uri:
+        url: "{{ healthchecks_url }}/ping/{{ hc_uuid }}/fail"
+        method: GET
+        timeout: 10
+      run_once: true
+      when:
+        - hc_uuid | length > 0
+        - result.rc != 0
+      ignore_errors: true
+
+    # Last task on purpose: everything that has to be recorded is recorded by
+    # now. The script exits non-zero only on an uncaught exception, so this
+    # never fires on a mere finding.
+    - name: Fail the job when the script itself failed
+      ansible.builtin.fail:
+        msg: "{{ check_message }}"
+      when: result.rc | default(1) != 0
